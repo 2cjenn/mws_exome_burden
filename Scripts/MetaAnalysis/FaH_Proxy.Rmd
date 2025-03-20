@@ -1,0 +1,299 @@
+---
+title: "FaH_Proxy"
+author: "Jennifer Collister"
+date: "25/09/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(qqman)
+library(ggpubr)
+library(janitor)
+library(ggrepel)
+library(forcats)
+library(openxlsx)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+# Source shared functions
+source(config$scripts$shared)
+
+```
+
+# Logistic regression
+
+Run /home/jenniferco/MWS/Scripts/MetaAnalysis/FaH_Proxy.R as a job in background using the Jobs panel of RStudio.
+
+
+# Read original MWS Regenie results and meta
+
+```{r}
+
+mws <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws.csv")
+
+meta <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta.csv")
+
+meta_ids <- meta %>% pull(ID) %>% unique()
+
+sig_meta <- meta %>%
+  filter(Study == "meta") %>%
+  group_by(MASK) %>%
+  mutate(threshold = 0.05/n_distinct(SYMBOL)) %>%
+  ungroup() %>%
+  filter(P < threshold)
+
+masks <- meta %>% pull(MASK) %>% unique()
+
+```
+
+# Read Wilcox2023 FaH as proxy results
+
+
+```{r}
+
+FaH <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy.txt") %>%
+  mutate(
+    oriented_beta = Estimate, 
+    ID=paste0(SYMBOL, ":", Warning)
+    ) %>%
+  inner_join(mws %>% select(number_chrom, pos, SYMBOL) %>% distinct(), by="SYMBOL")
+
+fah_man_plot <- manplot_func(
+  sum_stats = FaH %>% filter(P>1e-100), 
+  trait_name=paste0("PTV variants"),
+  gene_based=TRUE,
+  sig = 0.05/17174,
+  subsig=0.001,
+  title_text=paste0("PTV variants using FaH as a proxy for case status as per Wilcox2023")
+  )
+
+tiff(paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/FaH_Manhattan.tiff"),
+     units="in", width=8, height=7, res=300)
+fah_man_plot
+dev.off()
+
+```
+
+# Plot z-scores against originals
+
+```{r, eval=FALSE}
+
+FaH_z <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy.txt") %>%
+  inner_join(mws %>% 
+               filter(MASK == "PTV", FREQ == "all", TEST == "ADD") %>%
+               select(number_chrom, pos, SYMBOL, z_MWS = z_score) %>% 
+               distinct(), 
+             by="SYMBOL")
+
+head(FaH_z)
+
+zplot <- ggplot(FaH_z, aes(z_MWS, z_score)) + 
+  geom_point(aes(color=factor(Warning, levels=c(0,1), labels=c("No", "Yes")))) +
+  geom_text_repel(aes(label=ifelse(abs(z_score - z_MWS)>3.5, SYMBOL, '')), max.overlaps=15) +
+  geom_abline(intercept=0, slope=1, linetype="dashed", color="grey") +
+  geom_abline(intercept=3.5, slope=1, linetype="dotted", color="grey") +
+  geom_abline(intercept=-3.5, slope=1, linetype="dotted", color="grey") +
+  ggtitle(label="Z score comparison for PTV mask between Wilcox2023 method and conventional approach",
+          subtitle="Among all women. Points where z-scores differ by >3.5 labelled") +
+  xlab("Original approach in Regenie") +
+  ylab("FaH as proxy for case status") +
+  scale_color_discrete(name="glm.fit Warning?") +
+  theme_light() +
+  theme(legend.position = 'top')
+
+tiff(paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/z_AllPTV.tiff"), units="in", width=8, height=7, res=300)
+zplot
+dev.off()
+
+zplot
+
+```
+
+# Plot for other masks
+
+```{r, eval=FALSE}
+
+sig_z <- function(infile, mask, title, outfile) {
+  FaH_z <- data.table::fread(infile) %>%
+    filter(Unrelated==0) %>%
+    inner_join(mws %>% 
+                 filter(MASK == mask, FREQ == "all", TEST == "ADD") %>%
+                 select(number_chrom, pos, SYMBOL, z_MWS = z_score) %>% 
+                 distinct(), 
+               by="SYMBOL")
+    
+    if(mask == "PTV") {
+      PTV_genes <- sig_meta %>% filter(MASK == "PTV") %>% pull(SYMBOL)
+      FaH_z <- FaH_z %>% filter(SYMBOL %in% PTV_genes)
+    }
+  
+  zplot <- ggplot(FaH_z, aes(z_MWS, z_score, label=SYMBOL)) + 
+    geom_point() +
+    geom_text_repel() +
+    geom_abline(intercept=0, slope=1, linetype="dashed", color="grey") +
+    xlim(0,12) + ylim(0,12) +
+    xlab("Regenie") +
+    ylab("FaH as proxy") +
+    theme_light() +
+    theme(legend.position = 'top')# c(0.2, 0.9))
+  
+  tiff(outfile, units="in", width=8, height=7, res=300)
+  print(
+    zplot +
+      ggtitle(
+        label=paste0("Z score comparison for ", title, " mask between Wilcox2023 and conventional methods"),
+        subtitle="Significant genes from meta-analysis only"
+        )
+    )
+  dev.off()
+  
+  return(zplot)
+}
+
+```
+
+```{r, eval=FALSE}
+
+gridExtra::grid.arrange(
+
+  sig_z(infile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy_PTV.txt",
+        mask = "PTV",
+        title = "PTV",
+        outfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/z_sigPTV.tiff") +
+    ggtitle(label="PTV variants"),
+  
+  sig_z(infile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy_Rare.txt",
+        mask = "Rare",
+        title = "Rare missense",
+        outfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/z_sigRare.tiff") +
+    ggtitle(label="Rare missense variants"),
+  
+  sig_z(infile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy_CADD.txt",
+        mask = "PTV.CADD",
+        title = "PTV & CADD",
+        outfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/z_sigCADD.tiff") +
+    ggtitle(label="PTV and CADD missense variants"),
+  
+  sig_z(infile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/FaH_Proxy_Helix.txt",
+        mask = "PTV.Helix",
+        title = "PTV & Helix",
+        outfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/FaH_Proxy/z_sigHelix.tiff") +
+    ggtitle(label="PTV and Helix missense variants"),
+  top="Z score comparison between family history as proxy approach and conventional methods",
+  bottom="Significant genes from meta-analysis only"
+)
+
+```
+
+# Carrier counts table
+
+```{r, eval=FALSE}
+
+pheno <-data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/phenofiles/bc_famhist_proxy_pheno.txt") %>% 
+  select(IID, bc_famhist_proxy) %>%
+  filter(!is.na(bc_famhist_proxy))
+
+variant_list  <- vector("list", 4)
+names(variant_list) <- masks
+
+for (mask in masks) {
+  file <- dplyr::case_when(
+    mask %in% c("PTV", "Rare") ~ "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/gene_panel/masks/BCAC_masks/BCAC_rare_missense_anno.txt",
+    mask == "PTV.CADD" ~ "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/gene_panel/masks/BCAC_masks/BCAC_cadd_missense_anno.txt",
+    mask == "PTV.Helix" ~ "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/gene_panel/masks/BCAC_masks/BCAC_helix_missense_anno.txt",
+    TRUE ~ "Oops"
+  )
+  file_masks <- c("PTV" = "PTV", "Rare" = "rare_missense", "PTV.CADD" = "cadd_missense", "PTV.Helix" = "helix_missense")
+  sig_genes <- sig_meta %>%
+    filter(MASK == mask) %>%
+    pull(SYMBOL) %>%
+    unique()
+  
+  gene_vars <- data.table::fread(file, col.names=c("ID", "SYMBOL", "MASK")) %>%
+    filter(MASK == file_masks[mask], SYMBOL %in% sig_genes)
+  
+  raw_vars <- extract_variants_bfile(
+    gene_vars %>% pull(ID), 
+    bfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/pVCF/exome_PLINK/OXFORD-MWS_Freeze_One.norm",
+    plink_bin = config$software$plink2
+    )
+  
+  variants <- as.data.frame(raw_vars) %>%
+    select(-FID, -PAT, -MAT, -SEX, -PHENOTYPE) %>%
+    mutate(across(starts_with("chr"), ~2-as.numeric(.x))) %>%
+    pivot_longer(cols=starts_with("chr"), names_to="ID", values_to="genotype") %>%
+    mutate(ID = str_remove(ID, "chr"),
+           ID = str_remove(ID, "_[^.]*$")) %>%
+    left_join(gene_vars, by="ID")
+  
+  variant_list[[mask]] <- variants
+}
+
+rm(raw_vars)
+rm(variants)
+
+all_variants <- bind_rows(variant_list) %>% 
+  inner_join(pheno, by="IID") %>%
+  filter(!is.na(genotype)) %>%
+  group_by(ID) %>%
+  mutate(none_present = sum(genotype) ==  0,
+         singleton = sum(genotype) == 1) %>%
+  filter(none_present == FALSE) %>%
+  select(-none_present)
+
+rm(variant_list)
+
+head(all_variants)
+data.table::fwrite(all_variants, file="/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/gene_panel/regenie/BCAC_masks/meta_sig_vars.csv")
+
+```
+
+```{r}
+
+all_variants <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/gene_panel/regenie/BCAC_masks/meta_sig_vars.csv")
+head(all_variants)
+
+```
+
+## Case/control carrier counts
+
+```{r}
+
+count_by_mask <- all_variants %>%
+  group_by(SYMBOL, MASK, bc_famhist_proxy, IID) %>%
+  summarise(burden = sum(genotype) > 0, .groups="drop_last") %>%
+  summarise(n = sum(burden), pop=n(), .groups="drop_last") %>%
+  arrange(MASK, SYMBOL) %>%
+  mutate(pct = format(100*round(n/pop,3), nsmall=1),
+         n_pct = paste0(n, " (", pct, "%)"),
+         bc_famhist_proxy = factor(bc_famhist_proxy, levels=c(0, 0.5, 1, 1.5), labels=c("Control", "Family history", "Case", "Case and family history")),
+         pretty_pop = format(pop, big.mark=",")) %>% 
+  select(bc_famhist_proxy, pretty_pop, MASK, SYMBOL, n_pct) %>%
+  pivot_wider(names_from=c(bc_famhist_proxy, pretty_pop), names_sep=", n=", values_from=n_pct)
+
+count_by_mask
+
+list_of_datasets <- split(count_by_mask, count_by_mask$MASK) %>%
+  lapply(., function(x) {x %>% select(-MASK)})
+write.xlsx(list_of_datasets, file = "/home/jenniferco/MWS/Manuscript/Tables/FaH_Proxy.xlsx")
+
+```
+

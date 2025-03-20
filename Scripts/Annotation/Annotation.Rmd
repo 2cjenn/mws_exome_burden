@@ -1,0 +1,218 @@
+---
+title: "Annotation"
+author: "Jennifer Collister"
+date: "21/12/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+```
+
+# Annotation
+
+Rearrange siteQC file to suitable [VEP input](https://www.ensembl.org/info/docs/tools/vep/vep_formats.html#default) for annotation of QC'd variants.
+
+VEP also supports using VCF (Variant Call Format) version 4.0. This is a common format used by the 1000 genomes project, and can be produced as an output format by many variant calling tools:
+
+> #CHROM  POS        ID      REF  ALT            QUAL  FILTER  INFO  FORMAT
+> 1       65568      .       A    C              .     .       .     .
+
+Tried using `--fork 10` to speed things up - got this error "DBD::SQLite::st execute failed: database disk image is malformed at vep/plugins/LoF.pm" which led me to [this issue thread](https://github.com/konradjk/loftee/issues/45)
+
+Looks like LOFTEE can't be used with `--fork` - [they use HAIL](https://github.com/konradjk/loftee/issues/71) to handle partitioning instead.
+
+So, time to partition.
+
+```{r}
+
+siteQC <- fread(file.path(config$data$genetic, "lof_rollups", "OXFORD-MWS_Freeze_One.siteQC.txt.gz"))
+head(siteQC)
+
+siteQC$newCHR <- ifelse(siteQC$CHR == "23",  "X", 
+                        ifelse(siteQC$CHR == "24", "Y", 
+                               as.character(siteQC$CHR)))
+
+anno_input <- siteQC %>% 
+  select(newCHR, POS, REF, ALT) %>%
+  mutate(ID = paste0(newCHR, ":", POS, "_", REF, "_", ALT),
+         QUAL = NA,
+         FILTER = NA,
+         INFO = NA,
+         FORMAT = NA) %>%
+  select(`#CHROM`=newCHR, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT)
+
+head(anno_input)
+table(anno_input$`#CHROM`)
+
+for (chr in unique(anno_input$`#CHROM`)) {
+  print(chr)
+  out <- anno_input %>% 
+    filter(`#CHROM` == chr)
+  
+  print(nrow(out))
+  
+  # Could split into chunks of 15000 variants (as done by konrad in LOFTEE plugin issues)
+  # But no rush, chromosome at a time should be fine for now.
+  # vars <- 15000
+  # n <- nrow(out)
+  # chunks <- split(out, rep(1:ceiling(n/vars),each=vars)[1:n])
+  # print(length(chunks))
+  
+  write_delim(out, delim="\t",
+            file=paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/batch_siteQC/siteQC_", chr, ".vcf"))
+}
+
+
+```
+
+## Run VEP on each chromosome
+
+Bash chunk to work on each chr. Output in .tab format this time, and remember the --everything option!
+
+```{bash, eval=FALSE}
+
+chr=1
+vep -i /shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/batch_siteQC/siteQC_${chr}.vcf \
+  -o /shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/batch_siteQC/siteQC_${chr}_anno.tab \
+  --tab --everything \
+  --offline --cache --dir_cache /home/jenniferco/resources/VEP/ \
+  --dir_plugins /home/jenniferco/.vep/Plugins/ \
+  --plugin dbNSFP,/home/jenniferco/.vep/Plugins/dbNSFP4.5a_grch38.gz,ALL \
+  --plugin LOEUF,file=/home/jenniferco/.vep/Plugins/supplement/loeuf_dataset_grch38.tsv.gz,match_by=gene \
+  --plugin LoF,loftee_path:/home/jenniferco/.vep/Plugins/loftee,human_ancestor_fa:/home/jenniferco/resources/VEP/human_ancestor/human_ancestor.fa.gz,conservation_file:/home/jenniferco/resources/VEP/conservation/phylocsf_gerp.sql
+
+```
+
+# Write whole annotation into duckdb database
+
+```{r}
+
+library(DBI)
+library(duckdb)
+library(dbplyr)
+
+write_to_db <- function(data, dbname, tblname, overwrite=FALSE, append=FALSE, temporary=FALSE) {
+  con <- dbConnect(duckdb::duckdb(), dbdir=dbname, read_only=FALSE)
+  on.exit(dbDisconnect(con, shutdown=TRUE))
+  
+  dbWriteTable(con, name=tblname, value=data, overwrite=overwrite, append=append, temporary=temporary)
+}
+
+
+all_chr <- c(seq(1, 22, by=1), "X", "Y")
+dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+
+for (chr in all_chr) {
+  anno_file <- paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/batch_siteQC/siteQC_", chr, "_anno.vcf")
+  print(anno_file)
+  
+  anno_chr <- fread(file=anno_file,
+                    skip="#Uploaded_variation", sep="\t", header=T, 
+                    na.strings="-", check.names=TRUE,
+                    colClasses=c("hg18_chr"="character", "hg19_chr"="character",
+                                 "PUBMED"="character", "chr"="character")) %>%
+    rename(Uploaded_variation = X.Uploaded_variation) %>%
+    mutate(Uploaded_variation = str_replace(Uploaded_variation, pattern="X:", replacement="23:"),
+           Uploaded_variation = str_replace(Uploaded_variation, pattern="Y:", replacement="24:"),
+           chr = dplyr::case_when(chr == "X" ~ "23",
+                                  chr == "Y" ~ "24",
+                                  TRUE ~ chr))
+  
+  print(nrow(anno_chr))
+  
+  if(chr == "1") {
+    write_to_db(data=anno_chr, dbname=dbname, tblname="annotation",
+                overwrite=TRUE)
+  } else {
+    write_to_db(data=anno_chr, dbname=dbname, tblname="annotation", 
+                overwrite=FALSE, append=TRUE)
+  }
+}
+
+
+```
+
+## Debug problems with column types
+
+Some chromosomes don't have any entries in a column so fread and duckdb guess the wrong column type
+
+Need to identify the offending cols and the correct type and modify the db accordingly
+
+```{r, eval=FALSE}
+
+anno_chr5 <- fread(file=paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/batch_siteQC/siteQC_5_anno.vcf"),
+                    skip="#Uploaded_variation", sep="\t", header=T, 
+                    na.strings="-", check.names=TRUE,
+                    colClasses=c("PUBMED"="character")) %>%
+    rename(Uploaded_variation = X.Uploaded_variation) %>%
+    mutate(Uploaded_variation = str_replace(Uploaded_variation, pattern="X:", replacement="23:"),
+           Uploaded_variation = str_replace(Uploaded_variation, pattern="Y:", replacement="24:"),
+           IMPACT = factor(IMPACT, levels=c("MODIFIER", "LOW", "MODERATE", "HIGH")),
+           VARIANT_CLASS = factor(VARIANT_CLASS, levels=c("SNV", "indel", "insertion", "deletion")),
+           LoF = factor(LoF, levels=c("OS", "LC", "HC")),
+           CANONICAL = ifelse(is.na(CANONICAL), FALSE, TRUE),
+           across(c(hg18_chr, hg19_chr, chr), factor(., levels=c("1", "2", "3", "4", "5", "6", 
+                                                         "7", "8", "9", "10", "11", "12", 
+                                                         "13", "14", "15", "16", "17", "18", 
+                                                         "19", "20", "21", "22", "X", "Y"))
+                  )
+    )
+
+# Error about Y not being int for a col in chr6
+colcheck <- which(anno_chr == "Y", arr.ind=TRUE)
+table(colcheck[,2])
+head(anno_chr5[,c(11, 78, 245, 351, 353, 766, 768)])
+# cols 766=hg18_chr, 768=hg19_chr
+
+
+# Could not convert string '34290629' to BOOL in chr9
+colcheck2 <- which(anno_chr == "34290629", arr.ind=TRUE)
+table(colcheck2[,2])
+head(anno_chr5[,c(75)])
+# cols 75=PUBMED<lgl>
+
+# dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+# con <- dbConnect(duckdb::duckdb(), dbdir=dbname, read_only=FALSE)
+# dbExecute(con, "ALTER TABLE annotation ALTER PUBMED TYPE VARCHAR")
+# dbDisconnect(con, shutdown=TRUE)
+
+# Could not convert string 'X' to INT32 in chrX
+current_types <- sapply(anno_chr5, class)
+new_types <- sapply(anno_chr, class)
+current_types[current_types != new_types]
+new_types[current_types != new_types]
+
+# dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+# con <- dbConnect(duckdb::duckdb(), dbdir=dbname, read_only=FALSE)
+# dbExecute(con, "ALTER TABLE annotation ALTER chr TYPE TINYINT")
+# dbDisconnect(con, shutdown=TRUE)
+# 
+# con <- dbConnect(duckdb::duckdb(), dbdir=dbname, read_only=FALSE)
+# tbl(con, "annotation") %>%
+#   count(chr) %>%
+#   collect()
+# dbDisconnect(con, shutdown=TRUE)
+
+```
+
+

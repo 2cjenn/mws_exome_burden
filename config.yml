@@ -1,0 +1,15 @@
+data:
+ genetic: "/shared/MWS_Regeneron_Data/MWS_regeneron"
+ original_stata: "/home/jenniferco/data/MWS_extract/20230816_mws_for_project_1023_data.dta"
+ snps: "/home/jenniferco/data/MWS_extract/mws_original_snp_results_project_1023.txt"
+ snp_info: "/home/jenniferco/data/MWS_extract/snp_info.csv"
+ censoring: "/home/jenniferco/data/MWS_extract/censoring.yml"
+ derived: "/home/jenniferco/MWS/Data/Derived"
+ linkage: "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/JenniferCollisterReneneronMap.txt"
+ overlap: "/home/jenniferco/data/MWS_extract/project_1023_ids_in_regeneron_and_ukbiobank.txt"
+software:
+ plink: "/home/jenniferco/software/plink"
+ plink2: "/home/jenniferco/software/plink2"
+tmp: "/home/jenniferco/tmp"
+scripts:
+ shared: "/shared/MWS_Regeneron_Data/MWS_regeneron/shared_scripts/SharedFunctions.R"

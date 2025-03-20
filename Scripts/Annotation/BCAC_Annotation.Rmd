@@ -1,0 +1,334 @@
+---
+title: "BCAC_Annotation"
+author: "Jennifer Collister"
+date: "22/08/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(qqman)
+library(ggpubr)
+library(janitor)
+library(ggrepel)
+library(forcats)
+library(DBI)
+library(duckdb)
+library(dbplyr)
+library(tictoc)
+library(jsonlite)
+library(httr2)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+# Source shared functions
+source(config$scripts$shared)
+
+```
+
+# Get annotations from Helix
+
+[Helix scores](https://helixlabs.ai/blog/helix_whitepaper/)
+
+## Get variants in format required to annotate
+
+Helix is available for missense variants only, so we'll filter to missense variants
+
+```{r, eval=FALSE}
+
+dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+con <- DBI::dbConnect(duckdb::duckdb(), dbname)
+
+helix_all <- tbl(con, "annotation") %>%
+  filter(Feature_type == "Transcript",
+         (is.na(MANE_SELECT) & CANONICAL == "YES") | !is.na(MANE_SELECT),
+         BIOTYPE == "protein_coding") %>% 
+  select(Uploaded_variation, Consequence, Gene, Feature, Feature_type, HGVSc, HGVSp) %>%
+  mutate(ID = str_replace_all(Uploaded_variation, pattern="_", replacement=":")) %>%
+  collect()
+
+DBI::dbDisconnect(con, shutdown=TRUE)
+
+helix_missense <- helix_all %>%
+  mutate(Consequence = str_split_i(Consequence, pattern=",", i=1)) %>%
+  filter(Consequence %in% c("stop_lost", "start_lost", "transcript_amplification",
+                            "inframe_insertion", "missense_variant", 
+                            "protein_altering_variant", "splice_region_variant"))
+
+head(helix_missense)
+
+helix_vars <- helix_missense %>% 
+  separate_wider_delim(HGVSp, delim=":p.", names=c("ENSP", "Aminos"), cols_remove=FALSE) %>%
+  mutate(acid1 = substr(Aminos, 1, 3),
+         residue = substr(Aminos, 4, nchar(Aminos)-3),
+         acid2 = substr(Aminos, nchar(Aminos)-2, nchar(Aminos))) %>%
+  arrange(Feature, residue, acid2)
+
+head(helix_vars)
+
+helix_uniques <- helix_vars %>% select(-ID, -HGVSc, -Uploaded_variation) %>% distinct()
+
+data.table::fwrite(helix_uniques, file="/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/helix/MWS_variants.txt", 
+                   col.names=TRUE)
+
+```
+
+## Annotate
+
+Run Helix_MWS.R
+
+# Combine with existing annotation
+
+We need
+
+* 1000 genomes phase 3 allele frequency
+* sequence ontology variant consequences 
+* exon/intron number
+* CADD score
+* Helix score
+
+The masks we need to produce are: PTV, rare missense, deleterious rare missense (CADD > 20) and deleterious rare missense (Helix > 0.5)
+
+The BCAC paper doesn't specify how they define PTV, so we will use the definition from [Palmer2022](https://www.nature.com/articles/s41588-022-01034-x) Supplementary Table 5:
+
+> Transcript ablation, splice acceptor variant, splice donor variant, stop gained, frameshift variant.
+
+They also define missense as:
+
+> Stop lost, start lost, transcript amplification, inframe insertion, inframe deletion, missense variant, protein altering variant, splice region variant.
+
+
+This seems to broadly agree with [Liu2023](https://www.nature.com/articles/s41588-023-01305-1#Sec2)
+
+> (1) PTVs, defined as any mutation that introduced a stop codon, changed the frame of the open reading frame or introduced a change at a predicted splice donor or splice acceptor site
+
+And [Zhao2024](https://www.nature.com/articles/s41588-024-01694-x#Sec9)
+
+> Stop-gained, splice acceptor and splice donor variants were merged into a combined PTV category, while annotations for missense and synonymous variants were adopted directly from VEP
+
+The [All by All](https://github.com/atgu/aou_gwas/blob/c27c06caa9614251b48bc17d1495138cb3d58d1d/utils/annotations.py#L5) tables appear to use the same definitions as the [Neale lab](https://github.com/Nealelab/ukb_common/blob/9ec920ce9e0c39c4b9baf896ae820c9e0d7f167a/utils/annotations.py) UKB annotations.
+
+> PLOF_CSQS = ["transcript_ablation", "splice_acceptor_variant",
+             "splice_donor_variant", "stop_gained", "frameshift_variant"]
+
+> MISSENSE_CSQS = ["stop_lost", "start_lost", "transcript_amplification",
+                 "inframe_insertion", "inframe_deletion", "missense_variant"]
+                 
+but this additionally uses Loftee to categorise the PTVs as pLoF or LC.
+
+The [Neale lab paper](https://www.cell.com/cell-genomics/fulltext/S2666-979X(22)00110-0) describes this as
+
+> Variants were grouped by Ensembl Gene ID and functional impact as follows:
+>
+> * pLoF: High-confidence LoF variants (as indicated by LOFTEE), including stop-gained, essential splice, and frameshift variants, filtered according to a set of first principles as described at https://github.com/konradjk/loftee
+> * missense|LC: Missense variants are grouped with in-frame insertions and deletions, as well as low-confidence LoF variants (filtered out by LOFTEE). The latter have a frequency spectrum consistent with missense variation, and affect a set of amino acids in a similar fashion (e.g. a frameshift in the final exon).
+
+
+```{r}
+
+dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+con <- DBI::dbConnect(duckdb::duckdb(), dbname)
+
+colnames <- tbl(con, "annotation") %>% head() %>% collect()
+
+anno <- tbl(con, "annotation") %>%
+  filter(Feature_type == "Transcript",
+         (is.na(MANE_SELECT) & CANONICAL == "YES") | !is.na(MANE_SELECT),
+         BIOTYPE == "protein_coding") %>%
+  select(
+    Uploaded_variation, Location, Allele, AF,
+    Gene, EXON, HGVSp,
+    Feature, Feature_type, Consequence, 
+    IMPACT, VARIANT_CLASS, SYMBOL, 
+    CADD_phred, CADD_raw, CADD_raw_rankscore
+  ) %>%
+  group_by(Uploaded_variation) %>%
+  slice_max(IMPACT, with_ties=FALSE) %>%
+  ungroup() %>%
+  mutate(ID = str_replace_all(Uploaded_variation, pattern="_", replacement=":")) %>%
+  collect()
+
+DBI::dbDisconnect(con, shutdown=TRUE)
+
+list_exonic <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/exon_target_regions/exonic_vars.txt", 
+                                 col.names=c("var")) %>% 
+  pull(var)
+
+exonic <- anno %>% 
+  separate_wider_delim(Location, delim="-", names=c("chrpos", "pos2"), too_few="align_start", cols_remove=FALSE) %>%
+  filter(chrpos %in% list_exonic) %>%
+  separate_wider_delim(chrpos, delim=":", names=c("chr", "pos"), cols_remove=TRUE) %>%
+  separate_wider_delim(EXON, delim="/", names=c("exon_n", "exon_total")) %>%
+  mutate(
+    chr = str_remove(chr, "chr"),
+    pos = as.integer(pos),
+    exon_n = as.numeric(exon_n),
+    exon_total = as.numeric(exon_total)
+  )
+
+penultimate <- exonic %>% 
+  filter(
+    exon_n == exon_total - 1
+  ) %>%
+  select(chr, pos, SYMBOL) %>%
+  group_by(SYMBOL) %>%
+  slice_max(pos) %>%
+  ungroup() %>%
+  unique() %>%
+  mutate(
+    pos_50 = pos - 50,
+    pos_list = mapply(seq, from=pos_50, to=pos, by=1, SIMPLIFY = FALSE)
+  ) %>%
+  select(chr, pos_list, SYMBOL) %>%
+  tidyr::unnest(pos_list) %>%
+  mutate(chrpos = paste0(chr, ":", pos_list)) %>%
+  pull(chrpos)
+
+freq <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/freq/all.afreq") 
+helix <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/helix/MWS_anno.txt")
+
+annotations <- exonic %>%
+  filter(!is.na(SYMBOL)) %>%
+  mutate(MAF_1kg = ifelse(AF < 0.5, AF, 1-AF)) %>% 
+  dplyr::left_join(helix, join_by(Feature == transcript_id, HGVSp == HGVSp)) %>%
+  dplyr::left_join(
+    freq %>%
+      mutate(MAF = ifelse(ALT_FREQS < 0.5, ALT_FREQS, 1 - ALT_FREQS)) %>%
+      select(ID, MAF), 
+    by="ID") %>%
+  mutate(
+    Consequence = str_split_i(Consequence, pattern=",", i=1),
+    PTV = dplyr::case_when(
+      ! Consequence %in% c("transcript_ablation", "splice_acceptor_variant", "splice_donor_variant", "stop_gained", "frameshift_variant") ~ "Not a PTV",
+      exon_n == exon_total ~ "Last exon",
+      Location %in% penultimate ~ "Last 50bp of penultimate exon",
+      TRUE ~ "PTV"
+    ),
+    missense = Consequence %in% c("stop_lost", "start_lost", "transcript_amplification",
+                                         "inframe_insertion", "missense_variant", "protein_altering_variant", "splice_region_variant"),
+    # If variant not present in 1kg, that's fine
+    rare_missense = missense & MAF < 0.001 & (MAF_1kg < 0.001 | is.na(MAF_1kg)),
+    cadd_missense = rare_missense & CADD_phred > 20,
+    helix_missense = rare_missense & deleterious > 0.5 & residue_type == acid1,
+  )
+
+# rm(helix)
+# rm(anno)
+# rm(freq)
+# rm(list_exonic)
+# rm(exonic)
+
+head(annotations)
+
+annotations %>% filter(pos == 99318162)
+
+```
+
+### Restrict to variants that meet Regeneron QC:
+
+* Hardy–Weinberg equilibrium: HWE threshold of 10^-15
+* Locus missingness: Locus missingness < 10%
+
+```{r}
+
+qc_vars <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/summaryQC/backman2021/excludeIDs_ALL.txt") %>%
+  mutate(ID = str_replace(str_replace_all(ID, ":", "_"), "_", ":")) %>%
+  pull(ID)
+
+qc_fail <- annotations %>% filter(Uploaded_variation %in% qc_vars)
+
+qc_succeed <- annotations %>% filter(!Uploaded_variation %in% qc_vars)
+
+```
+
+Excluding ones that fail this QC removes 19,810 variants from the annotated exonic regions.
+
+## Output in Regenie format
+
+### Annotation file
+
+```{r}
+
+anno_path <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/summaryQC/backman2021/masks"
+
+for(annotation in c("rare_missense", "cadd_missense", "helix_missense")) {
+  anno_file <- file.path(anno_path, paste0("BCAC_", annotation, "_anno.txt"))
+  
+  data <- qc_succeed %>% 
+    filter(PTV == "PTV") %>%
+    mutate(anno = "PTV") %>%
+    select(ID, SYMBOL, anno)
+  
+  data.table::fwrite(data, anno_file, append=FALSE, sep="\t", col.names=FALSE)
+  
+  data <- annotations %>% 
+    filter(.data[[annotation]] == TRUE) %>%
+    mutate(anno = annotation) %>%
+    select(ID, SYMBOL, anno)
+  
+  data.table::fwrite(data, anno_file, append=TRUE, sep="\t", col.names=FALSE)
+}
+
+```
+
+### Set file
+
+```{r}
+
+set_file <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/summaryQC/backman2021/masks/BCAC_set.txt"
+
+set <- qc_succeed %>%
+  select(GENE=SYMBOL, ID) %>%
+  separate_wider_delim(cols=ID, delim=":", names=c("CHR", "POS", NA, NA), cols_remove=FALSE) %>%
+  arrange(CHR, POS) %>%
+  group_by(GENE) %>%
+  mutate(CHR = as.numeric(CHR),
+         varlist = paste0(ID, collapse=",")) %>%
+  slice_min(POS, with_ties=FALSE) %>%
+  select(GENE, CHR, POS, varlist) %>%
+  filter(CHR != 24) %>%
+  arrange(CHR, GENE)
+
+head(set)
+
+data.table::fwrite(set, set_file, sep="\t", col.names=FALSE)
+  
+```
+
+### Masks file
+
+```{r}
+
+mask_path <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/summaryQC/backman2021/masks"
+
+for(annotation in c("rare_missense", "cadd_missense", "helix_missense")) {
+  mask_file <- file.path(mask_path, paste0("BCAC_", annotation, "_mask.txt"))
+  
+  if(annotation == "rare_missense") {
+     mask <- data.frame(mask=c("M1", "M2"), anno=c("PTV", "rare_missense"))
+  } else {
+    mask <- data.frame(mask=c("M1", "M2"), anno=c(paste0("PTV,", annotation), annotation))
+  }
+  data.table::fwrite(mask, mask_file, sep="\t", col.names=FALSE)
+}
+
+```
+
+Now move to /home/jenniferco/MWS/Scripts/Burden/RunRegenie.Rmd

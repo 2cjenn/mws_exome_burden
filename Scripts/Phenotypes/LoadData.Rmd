@@ -1,0 +1,412 @@
+---
+title: "LoadData"
+author: "Jennifer Collister"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(rmarkdown)
+library(markdown)
+library(haven)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(arsenal) # pretty tables
+library(pander)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+
+# Specify the markdown format for knitr tables, otherwise they're not compatible with kableExtra
+options(knitr.kable.NA='', knitr.table.format = "markdown")
+options(kableExtra.auto_format = FALSE)
+
+# Pander options
+panderOptions('table.alignment.default', function(df)
+    ifelse(sapply(df, is.numeric), 'right', 'left'))
+panderOptions('table.split.table', Inf)
+panderOptions('big.mark', ",")
+panderOptions('keep.trailing.zeros', TRUE)
+panderOptions('missing', '')
+
+# Set formatting options for tableby objects
+my_controls <- tableby.control(
+    test = F,
+    total = T,
+    #numeric.test = "kwt", cat.test = "chisq",
+    numeric.stats = c("meansd", "Nmiss", "medianq1q3"), 
+    cat.stats = c("countpct", "Nmiss"),
+    stats.labels = list(
+      meansd = "Mean (SD)",
+      # medianq1q3 = "Median (IQR)",
+      # range = "Min - Max",
+      Nmiss = "Missing",
+      Npct="N (Pct)"
+    ),
+    digits = 2L
+  )
+
+knitr::opts_chunk$set(include=TRUE, echo=TRUE, warning = FALSE, message = FALSE) 
+
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = yaml.load_file(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+```
+
+# Load raw data from stata
+
+Note for future reference: I have date of first recorded breast cancer, but not directly (from ons_cancer_incidence_all) the ICD code or morphology for it.
+
+At the moment we're not using ICD code or morphology for any analyses, and using `anti_join` I think I'm happy that everything lines up ok joining on incidence date so don't want to bother Sau Wan now, but would be good to ask for ICD code and morphology in the next data request.
+
+```{r, echo=FALSE}
+
+censoring <- yaml.load_file(config$data$censoring)
+
+ukb_overlap <- data.table::fread(config$data$overlap) %>% pull(person_id)
+
+# Data extract from Sau Wan
+# Drop tumour characteristic columns as we'll join the other extract
+stata <- read_dta(config$data$original_stata) %>%
+  select(-starts_with("tc_"))
+
+
+# Tumour info - separate extract containing tumour info for C50 breast cancers only
+tc_c50only <- read_dta("/home/jenniferco/data/MWS_extract/20250228_BC_tc_incidca_DSW_for_project_1023_data.dta") %>%
+  mutate(
+    cancer_icd = ifelse(cancer_icd == "", NA, cancer_icd),
+    morphology = ifelse(morphology == "", NA, morphology),
+    count_missing = rowSums(is.na(.))) %>%
+  select(-starts_with("dupid")) %>%
+  unique()
+
+# Join to main data using date of first breast cancer diagnosis
+# If a woman has multiple tumour records on the same date, keep the one with the most complete tumour characteristics
+tc_info <- stata %>% 
+  select(person_id, firstc50) %>%
+  inner_join(tc_c50only, join_by("person_id", "firstc50" == "incid_date")) %>%
+  group_by(person_id) %>%
+  slice_min(count_missing, with_ties = FALSE) %>%
+  select(-count_missing)
+
+# Combine data
+data <- stata %>%
+  left_join(tc_info, by=c("person_id", "firstc50")) %>%
+  filter(!person_id %in% ukb_overlap) %>%
+  mutate(across(contains("date"), ~ as.Date(.x, format="%Y-%m-%d")),
+         across(where(is.labelled), ~ as_factor(.x)),
+         recruit_date = as.Date(paste0("15/", sprintf("%02d", r_month_sign), "/", r_year_sign), format="%d/%m/%Y"),
+         date_of_birth = as.Date(paste0("15/", sprintf("%02d", r_month_birth), "/", r_year_birth), format="%d/%m/%Y"),
+         r_age = coalesce(r_age_screened, floor(as.numeric(difftime(recruit_date, date_of_birth), units="days")/365.25)),
+         blood_age = floor(as.numeric(difftime(dsw_blood_date, date_of_birth), units="days")/365.25),
+         # Breast cancer status
+         breast_cancer = ifelse(is.na(firstc50), 0, 1),
+         cancer1_C50 = ifelse(startsWith(cancer1_icd4, "C50") | startsWith(cancer1_icd4, "174"), 1, 0),
+         cancer1_D05 = ifelse(startsWith(cancer1_icd4, "D05") | startsWith(cancer1_icd4, "233"), 1, 0),
+         # Age at breast cancer diagnosis
+         brca_age = round(as.numeric(difftime(firstc50, date_of_birth, unit="weeks"))/52.25, digits=1),
+         # Tumour information
+         tc_screening_status = factor(tc_screening_status, levels=c(1,2,3), labels=c("Screen-detected", "Interval", "Other")),
+         # Subtypes
+         subtype_er = ifelse(breast_cancer==1, tc_er_status, NA),
+         subtype_pr = ifelse(breast_cancer==1, tc_pr_status, NA),
+         subtype_her2 = ifelse(breast_cancer==1, tc_her2_status, NA),
+         subtype_tripleneg = ifelse(subtype_er + subtype_pr + subtype_her2 == 0, 1, 0),
+         subtype_luminalA = ifelse(subtype_er == 1 & subtype_pr == 1 & subtype_her2 == 0, 1, 0),
+         subtype_luminalB = ifelse(subtype_er == 1 & subtype_pr == 0 & subtype_her2 == 1, 1, 0)
+         ) %>%
+  ##############
+  # Exclusions #
+  ##############
+  mutate(
+    # We don't want to consider women who had a complete mastectomy as controls
+    mastectomy = factor(
+      dplyr::case_when(
+        is.na(mind_mast) ~ "No mastectomy",
+        is.na(firstc50) ~ "Mastectomy without breast cancer",
+        mind_mast - firstc50 < -365 ~ "Mastectomy more than a year before breast cancer",
+        mind_mast - firstc50 < 0 ~ "Mastectomy within a year before breast cancer",
+        mind_mast - firstc50 >= 0 ~ "Mastectomy after breast cancer",
+        TRUE ~ "Other"
+      )
+    ),
+    # We don't want to consider women who've had a mastectomy as controls
+    across(.cols=c(breast_cancer, brca_age, starts_with("subtype_")),
+           ~ ifelse(mastectomy == "Mastectomy without breast cancer", NA, .)), # Excludes 536 individuals
+    # We don't want to consider women with carcinoma in situ as controls
+    in_situ = factor(
+      dplyr::case_when(
+        cancer1_D05 == 0 ~ "No carcinoma in situ",
+        is.na(firstc50) ~ "Carcinoma in situ without breast cancer",
+        cancer1_fudate - firstc50 < 0 ~ "Carcinoma in situ before breast cancer",
+        cancer1_fudate - firstc50 >= 0 ~ "Carcinoma in situ after breast cancer",
+        TRUE ~ "Other"
+      )),
+    # Exclude women with no baseline age
+    breast_cancer = ifelse(is.na(r_age), NA, breast_cancer),
+    # Sensitivity analysis - include women with carcinoma in situ as cases
+    breast_cancer_insitu = ifelse(in_situ == "Carcinoma in situ without breast cancer" & !is.na(breast_cancer), 1, breast_cancer),
+    # Exclude any women who had a diagnosis of carcinoma in situ without a diagnosis of breast cancer
+    across(.cols=c(breast_cancer, brca_age, starts_with("subtype_")), 
+           ~ ifelse(in_situ == "Carcinoma in situ without breast cancer", NA, .)) # Excludes 970 individuals
+  )
+
+rm(stata)
+
+table(data$breast_cancer, useNA='ifany')
+
+```
+
+## Family history as a surrogate for case status
+
+Variables
+* *Baseline*: r_br_ca_mother, r_br_ca_sisters, r_fam_hist_bc [derived]
+* *1st follow-up (yellow)*: f1_mbrstca, f1_fbrstca
+* *2nd follow-up (lilac)*: f2_mbrstca, f2_fbrstca, f2_sbrstca, f2_bbrstca
+* *3rd follow-up (apricot)*: f3_mbrstca, f3_fbrstca, f3_sbrstca, f3_bbrstca
+
+Following method from [Wilcox2023]() 
+
+> We used logistic regression analysis to test for an association between carriers of variants within a gene and breast cancer status. We incorporated family history as a surrogate for disease status, similar to the method presented in ref. 44. This markedly improves power because susceptibility variants will also be associated with family history; in particular, it allows information on males in the cohort with a family history of female breast cancer to be used. To do this, we treated genotype (0/1) as the dependent variable and family history weighted disease status as the covariate; the latter is defined as d + 1/2 f, where d = 0, 1 was the disease status of the genotyped individual and f = 0 or 1 according to whether the individual reported a positive first-degree family history.
+
+First-degree family history is parents, siblings and children. This should be full siblings not half siblings, but we don't have information to discriminate.
+
+```{r}
+
+famhist <- data %>% 
+  select(person_id,
+         r_br_ca_mother, r_br_ca_sisters, r_fam_hist_bc,
+         f1_datefu, f2_datefu, f3_datefu,
+         f1_mbrstca, f1_fbrstca,
+         f2_mbrstca, f2_fbrstca, f2_sbrstca, f2_bbrstca,
+         f3_mbrstca, f3_fbrstca, f3_sbrstca, f3_bbrstca
+         ) %>%
+  mutate(
+    f1_fam_hist_bc = dplyr::case_when(
+      is.na(f1_datefu) ~ NA,
+      !is.na(f1_mbrstca) ~ "Yes",
+      !is.na(f1_fbrstca) & f1_fbrstca == "Yes" ~ "Yes",
+      TRUE ~ "No"
+    ),
+    f2_fam_hist_bc = dplyr::case_when(
+      is.na(f2_datefu) ~ NA,
+      !is.na(f2_mbrstca) ~ "Yes",
+      !is.na(f2_fbrstca) ~ "Yes",
+      !is.na(f2_sbrstca) ~ "Yes",
+      !is.na(f2_bbrstca) ~ "Yes",
+      TRUE ~ "No"
+    ),
+    f3_fam_hist_bc = dplyr::case_when(
+      is.na(f3_datefu) ~ NA,
+      !is.na(f3_mbrstca) ~ "Yes",
+      !is.na(f3_fbrstca) ~ "Yes",
+      !is.na(f3_sbrstca) ~ "Yes",
+      !is.na(f3_bbrstca) ~ "Yes",
+      TRUE ~ "No"
+    ),
+    fam_hist_bc = dplyr::case_when(
+      !is.na(r_fam_hist_bc) & r_fam_hist_bc == "Yes" ~ "Yes",
+      !is.na(f1_fam_hist_bc) & f1_fam_hist_bc == "Yes" ~ "Yes",
+      !is.na(f2_fam_hist_bc) & f2_fam_hist_bc == "Yes" ~ "Yes",
+      !is.na(f3_fam_hist_bc) & f3_fam_hist_bc == "Yes" ~ "Yes",
+      !is.na(r_br_ca_mother) & r_br_ca_mother == "Don't know" ~ NA,
+      !is.na(r_br_ca_sisters) & r_br_ca_sisters == "Not known" ~ NA,
+      is.na(r_fam_hist_bc) & is.na(f1_datefu) & is.na(f2_datefu) & is.na(f3_datefu) ~ NA,
+      TRUE ~ "No"
+    )
+  )
+
+table(famhist$fam_hist_bc, useNA='ifany')
+
+```
+
+# Create phenotype file for use in exwas
+
+Prepare multiple phenotypes
+
+* Any breast cancer
+* ER +ve
+* PR +ve
+* HER2 +ve
+* Triple -ve
+* Stage (2 or below vs 3 or above)
+* Grade (2 or below vs 3 or above)
+* Luminal A (ER+ve and PR+ve but HER2-ve)
+* Luminal B (ER+ve and HER2+VE but PR-ve)
+
+For PLINK, code case as 2 and control as 1
+
+For Regenie, binary traits must be coded as 0=control, 1=case, NA=missing.
+
+Note that Regenie Step 1 imputes phenotypes if missing data. This apparently led to inconsistent behaviour in Step 2 depending if one or multiple continuous phenotypes were being run simultaneously. See [docs](https://rgcgithub.github.io/regenie/options/#phenotype-file-format) and this [github issue](https://github.com/rgcgithub/regenie/issues/189). I'm therefore splitting each phenotype out into its own file to be safe.
+
+```{r}
+
+ancestry <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/relationships/OXFORD-MWS_Freeze_One.GxS.commonsnps_samples_ancestries.txt")
+
+invitation_stats <- data.table::fread("/home/jenniferco/data/MWS_extract/invitation_info.csv")
+
+linkage <- read.delim(config$data$linkage, sep=",", col.names=c("person_id", "iid"))
+linkable <- data %>% 
+  merge(linkage, by="person_id") %>% 
+  left_join(ancestry %>% select(iid=IID, Class), by="iid") %>%
+  left_join(famhist %>% select(person_id, fam_hist_bc), by="person_id") %>%
+  left_join(invitation_stats, join_by("iid"=="regeneron_id"))
+
+all_pheno <- linkable %>% transmute(
+  FID = iid,
+  IID = iid,
+  bc_famhist_proxy = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    is.na(fam_hist_bc) ~ NA,
+    breast_cancer == 0 & fam_hist_bc == "No" ~ 0,
+    breast_cancer == 0 & fam_hist_bc == "Yes" ~ 0.5,
+    breast_cancer == 1 & fam_hist_bc == "No" ~ 1,
+    breast_cancer == 1 & fam_hist_bc == "Yes" ~ 1.5,
+    TRUE ~ -1
+  ),
+  breast_cancer = breast_cancer + 1,
+  bc_screen = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    breast_cancer == 1 ~ 1,
+    is.na(tc_screening_status) ~ NA,
+    tc_screening_status == "Screen-detected" ~ 2,
+    TRUE ~ NA
+  ),
+  bc_interval = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    breast_cancer == 1 ~ 1,
+    is.na(tc_screening_status) ~ NA,
+    tc_screening_status == "Interval" ~ 2,
+    TRUE ~ NA
+  ),
+  breast_cancer_w = ifelse(Class == "EUR", breast_cancer, NA),
+  breast_cancer_insitu = breast_cancer_insitu + 1,
+  age_breast_cancer = brca_age,
+  bc_before_55 = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    breast_cancer == 1 ~ 1,
+    is.na(brca_age) ~ NA,
+    brca_age < 55 ~ 2,
+    TRUE ~ NA
+  ),
+  bc_after_55 = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    breast_cancer == 1 ~ 1,
+    is.na(brca_age) ~ NA,
+    brca_age >= 55 ~ 2,
+    TRUE ~ NA
+  ),
+  bc_withFH_strat = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    is.na(fam_hist_bc) ~ NA,
+    fam_hist_bc == "No" ~ NA,
+    breast_cancer == 1 ~ 1,
+    fam_hist_bc == "Yes" ~ 2,
+    TRUE ~ NA
+  ),
+  bc_noFH_strat = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    is.na(fam_hist_bc) ~ NA,
+    fam_hist_bc == "Yes" ~ NA,
+    breast_cancer == 1 ~ 1,
+    fam_hist_bc == "No" ~ 2,
+    TRUE ~ NA
+  ),
+  bc_noCVD_controls = dplyr::case_when(
+    is.na(breast_cancer) ~ NA,
+    breast_cancer == 2 ~ 2,
+    is.na(invited_reason) ~ NA,
+    breast_cancer == 1 ~ 1,
+    TRUE ~ NA
+  )
+)
+head(all_pheno)
+
+phenotypes <- colnames(all_pheno %>% select(-FID, -IID))
+
+```
+
+```{r, eval=FALSE}
+
+# Split each phenotype into its own file. Remove rows that are NA for this phenotype so they aren't imputed. 
+for(phenotype in phenotypes) {
+  pheno <- all_pheno[!is.na(all_pheno[phenotype]), c("FID", "IID", phenotype)]
+  readr::write_delim(pheno, delim="\t", file=paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/phenofiles/", phenotype, "_pheno.txt"))
+}
+
+```
+## Create covariate file for use in ExWAS
+
+```{r, eval=FALSE}
+
+pcs <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/relationships/OXFORD-MWS_Freeze_One.GxS.commonsnps.eigenvec") %>%
+  select(FID = V1,
+         IID = V1,
+         pc1 = V3,
+         pc2 = V4,
+         pc3 = V5,
+         pc4 = V6,
+         pc5 = V7,
+         pc6 = V8,
+         pc7 = V9,
+         pc8 = V10,
+         pc9 = V11,
+         pc10 = V12)
+head(pcs)
+
+covars <- linkable %>%  transmute(
+  FID = iid,
+  IID = iid,
+  Age = r_age
+  ) %>%
+  merge(pcs, by=c("FID", "IID"))
+
+head(covars)
+
+readr::write_delim(covars, delim="\t", 
+            file="/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/covarfile/covars.txt")
+
+```
+
+# Table 1 for gene burden paper
+
+```{r, results='asis'}
+
+part1 <- tableby(breast_cancer ~ 
+                   r_age + blood_age + brca_age +
+                   fam_hist_bc +
+                   tc_er_status + tc_pr_status + tc_her2_status + tripleneg_status, 
+                 data=linkable %>% 
+                   filter(!is.na(breast_cancer)) %>%
+                   mutate(
+                     across(ends_with("_status"), function(x) factor(x, levels=c(0,1), labels=c("Negative", "Positive"))),
+                     tripleneg_status = factor(subtype_tripleneg, levels=c(0,1), labels=c("Not triple negative", "Triple negative")),
+                     r_num_ftps = as.numeric(r_num_ftps)
+                          ), 
+                 control=my_controls)
+
+pretty_list <- list(
+  "r_age" = "Age at recruitment",
+  "blood_age" = "Age at blood sample",
+  "brca_age" = "Age at diagnosis of breast cancer",
+  "fam_hist_bc" = "First degree family history of breast cancer"
+)
+
+summary(part1, labelTranslations = pretty_list,
+        title=paste0('Table 1. Descriptive statistics by breast cancer status'))
+
+```
+
+

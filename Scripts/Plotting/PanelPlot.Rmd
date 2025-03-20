@@ -1,0 +1,129 @@
+---
+title: "PanelPlot"
+author: "Jennifer Collister"
+date: "1/14/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(ggforestplot)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Forest plot
+
+For each of the 7 main genes:
+
+* Association in overall meta and by contributing study
+* Association by supplementary analysis
+  * Subtype ER/PR/HER2/TN
+  * Age before/after 55
+  * Screen/interval detected
+
+## Load data
+  
+```{r}
+
+# Chosen genes
+genes <- c("BRCA2", "BRCA1", "CHEK2", "PALB2", "ATM", "MAP3K1", "BARD1", "ATRIP", "SAMHD1", "LZTR1")
+
+# Load data
+meta <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta.csv") %>%
+  filter(SYMBOL %in% genes) %>%
+  select(SYMBOL, Category=Study, MASK, z_score) %>%
+  mutate(Facet="Study")
+
+all_burden <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/supplementary.csv") %>%
+  filter(SYMBOL %in% genes, Analysis %in% c("bc_before_55", "bc_after_55", "bc_interval", "bc_screen", "bc_noFH_strat", "bc_withFH_strat")) %>%
+  select(SYMBOL, Category=Analysis, MASK, z_score)  %>%
+  rbind(list(SYMBOL="MAP3K1", Category="bc_withFH_strat", MASK="PTV", z_score=NA)) %>%
+  mutate(Facet="Supplementary")
+
+```
+
+## Arrange into one dataframe
+
+```{r}
+
+# Combine dataframes
+forest_meta <- rbind(meta, all_burden) %>%
+  filter(
+    (SYMBOL %in% c("BRCA2", "BRCA1", "CHEK2", "PALB2", "ATM", "MAP3K1", "BARD1", "ATRIP") & MASK=="PTV") |
+      (SYMBOL=="SAMHD1" & MASK=="Rare") | 
+      (SYMBOL=="LZTR1" & MASK=="PTV.Helix")
+    ) %>%
+  mutate(
+    SYMBOL = factor(SYMBOL, levels=genes,
+                    labels=c("BRCA2", "BRCA1", "CHEK2", "PALB2", "ATM", "MAP3K1", "BARD1", "ATRIP", "SAMHD1", "LZTR1")),
+    MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.Helix"),
+                  labels=c("PTV", "Rare missense", "PTV and Helix missense")),
+    Category = factor(
+      Category, 
+      levels=c(
+        "meta", "bcac", "jurgens", "mws",
+        # "er", "pr", "her2", "tripleneg",
+        "bc_before_55", "bc_after_55", "bc_screen", "bc_interval", "bc_noFH_strat", "bc_withFH_strat"
+        ), 
+      labels=c(
+        "Meta-analysis", "BCAC & UKB", "All of Us & MGB", "MWS",
+        # "ER +ve", "PR +ve", "HER2 +ve", "Triple -ve",
+        "Age < 55", "Age ≥ 55", "Screen-detected", "Interval-detected", "No family history", "Family history"
+        )
+      ),
+    Facet = factor(
+      Facet,
+      levels=c("Study", "Supplementary"),
+      labels=c("Meta-analysis and\ncontributing datasets", "Supplementary analyses\n(MWS only)")
+    )
+    ) %>%
+  group_by(SYMBOL, Facet) %>%
+  arrange(Category) %>%
+  mutate(ranking = row_number()) %>%
+  ungroup() %>%
+  arrange(desc(ranking), SYMBOL) %>%
+  mutate(y_lab = fct_inorder(Category))
+
+```
+
+## Plot
+
+```{r, fig.height=5, fig.width=16}
+
+F1 <- ggplot(forest_meta, aes(z_score, y_lab)) + 
+  scale_y_discrete() +
+  geom_point(aes(x=z_score, color=MASK), size=4, shape=18) +
+  labs(title=paste0("Z scores for burden tests by gene and analysis, for genes significant in the meta-analysis"),
+       x = "Z score", color = "Mask") +
+  scale_x_continuous(name = "Z score") +
+  facet_grid(
+    rows=vars(Facet), cols=vars(SYMBOL),  axes="all_x", 
+    scales = "free", # https://github.com/const-ae/ggupset/issues/25
+    switch = "y"#, space="free_y"
+    ) + 
+  theme_forest() +
+  geom_stripes(odd = "#11111111", even = "#00000000") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  theme(
+    legend.position = "top", 
+    strip.text.y = element_text(size = 12, colour = "black", face="bold", angle = 0, hjust=0.5), # https://stackoverflow.com/a/2751201
+    strip.placement = "outside", # https://stackoverflow.com/questions/62017414/ggplot-moving-facet-wrap-y-labels-to-left-and-making-text-horizontal
+    axis.title.y = element_blank() # No y axis title so we can use the facet labels instead
+    ) 
+
+F1
+
+tiff(paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/panelForest/all_genes.tiff"),
+     units="in", width=14, height=6, res=600)
+F1
+dev.off()
+
+```
+
+
+

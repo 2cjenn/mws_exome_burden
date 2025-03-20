@@ -1,0 +1,900 @@
+---
+title: "BCAC_Annotation"
+author: "Jennifer Collister"
+date: "22/08/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(qqman)
+library(ggpubr)
+library(janitor)
+library(ggrepel)
+library(forcats)
+library(DBI)
+library(duckdb)
+library(dbplyr)
+library(tictoc)
+library(jsonlite)
+library(httr2)
+library(openxlsx)
+library(purrr)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+# Source shared functions
+source(config$scripts$shared)
+
+```
+
+This markdown should be run after BCAC_Annotation.Rmd which adds Helix annotations, creates BCAC masks and provides the code to run gene-based tests in Regenie.
+
+# Read Regenie outputs
+
+Combine across masks and calculate z-scores.
+
+The tests are two-tailed, so divide the P value by 2. The normal distribution is symmetric, so the z score is ±.
+
+```{r, eval=FALSE}
+
+regenie <- vector("list", 3)
+i <- 1
+for(file in c("rare", "cadd", "helix")) {
+  filename = paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/regenie/step2_gene/binary/breast_cancer_",
+                    file, "_breast_cancer.regenie")
+  data <- data.table::fread(filename)
+  
+  # Rearrange
+  data <- data %>% 
+    separate_wider_delim(cols=ID, delim=".", names=c("SYMBOL", "MASK", "FREQ"), too_many="merge", too_few="align_start") %>%
+    mutate(oriented_beta = BETA,
+           P = 10^(-LOG10P),
+           number_chrom=as.numeric(CHROM),
+           pos = GENPOS)
+  
+  if(file == "rare") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV", MASK == "M2" ~ "Rare", TRUE ~ "Uhoh"))
+    } else if(file == "cadd") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.CADD", MASK == "M2" ~ "CADD", TRUE ~ "Uhoh"))
+    } else if(file == "helix") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.Helix", MASK == "M2" ~ "Helix", TRUE ~ "Uhoh"))
+    }
+  data <- data %>% mutate(ID = paste0(SYMBOL, "_", MASK, "_", FREQ, "_", TEST))
+  regenie[[i]] <- data
+  i <- i + 1
+}
+
+mws <- dplyr::bind_rows(regenie) %>% 
+  filter(
+    FREQ == "all",
+    TEST == "ADD",
+    MASK %in% c("PTV", "Rare", "PTV.CADD", "PTV.Helix")
+  ) %>%
+  mutate(
+    ID = paste0(SYMBOL, "_", MASK),
+    z_score = BETA/SE,
+    MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix"))
+    )
+  
+rm(regenie)
+
+# data.table::fwrite(mws, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws.csv")
+
+```
+
+```{r}
+
+mws <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws.csv")
+
+```
+
+# Read in the BCAC gene-level outputs
+
+```{r, eval=FALSE}
+
+bcac_path <- "/home/jenniferco/data/Wilcox2023"
+files <- list(PTV = "GCST90267995.tsv", Rare = "GCST90267996.tsv", PTV.CADD = "GCST90267997.tsv", PTV.Helix = "GCST90267998.tsv")
+
+bcac_sep  <- vector("list", 3)
+i <- 1
+for(file in names(files)){
+  data <- data.table::fread(file.path(bcac_path, files[[file]])) %>% 
+    janitor::clean_names() %>%
+    rename(SYMBOL = gene,
+           P = p_value) %>%
+    mutate(MASK = file)
+  
+  bcac_sep[[i]] <- data
+  i <- i + 1
+}
+bcac <- dplyr::bind_rows(bcac_sep) %>% 
+  inner_join(mws %>% select(number_chrom, pos, SYMBOL) %>% distinct(), by="SYMBOL") %>%
+  mutate(ID = paste0(SYMBOL, "_", MASK),
+         oriented_beta = NA,
+         MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix")))
+
+head(bcac)
+
+data.table::fwrite(bcac, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/bcac.csv")
+
+```
+
+```{r}
+
+bcac <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/bcac.csv")
+
+```
+
+# All of Us
+
+The [Jurgens2024 ](https://www.nature.com/articles/s41588-024-01894-5) meta-analysis provides summary stats for All of Us and Mass General Brigham Biobank which we can use instead of the All by All - they contain slightly more AoU breast cancer cases.
+
+They have the following masks:
+
+> * hclof_noflag_POPMAX0.001 == LOF mask with MAF<0.1%
+* hclof_noflag_missense0.8_POPMAX0.001 == LOF + missense0.8 mask with MAF<0.1%
+* hclof_noflag_missense0.8_POPMAX0.001 == LOF + missense0.5 mask with MAF<0.1%
+* hclof_noflag_missense0.5_POPMAX0.00001 == LOF + missense0.5 mask with MAF<0.001%
+* missense0.5_POPMAX0.00001 == missense0.5 mask with MAF<0.001%
+* missense0.2_POPMAX0.00001 == missense0.2 mask with MAF<0.001%
+* hclof_noflag_POPMAX0.01 == LOF mask with MAF<1%
+* hclof_noflag_missense0.8_POPMAX0.01 == LOF + missense0.8 mask with MAF<1%
+* hclof_noflag_missense0.5_POPMAX0.01 == LOF + missense0.5 mask with MAF<1%
+
+We will map:
+
+* PTV = hclof_noflag_POPMAX0.001
+* Rare missense = missense0.2_POPMAX0.00001
+* CADD and Helix = either hclof_noflag_missense0.8_POPMAX0.001 or hclof_noflag_missense0.5_POPMAX0.001
+
+```{r, eval=FALSE}
+
+# dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+# con <- DBI::dbConnect(duckdb::duckdb(), dbname)
+# 
+# colnames <- tbl(con, "annotation") %>% head() %>% collect()
+# 
+# genes <- tbl(con, "annotation") %>%
+#   filter(Feature_type == "Transcript",
+#          (is.na(MANE_SELECT) & CANONICAL == "YES") | !is.na(MANE_SELECT),
+#          BIOTYPE == "protein_coding"
+#          ) %>%
+#   select(Gene, SYMBOL) %>%
+#   distinct() %>%
+#   collect()
+# 
+# DBI::dbDisconnect(con, shutdown=TRUE)
+# 
+# Jurgens_AoU_MGB <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/JurgensWang2024_all_files/All_Mixed_raw/AoU_250k_MGB_53k__10CarriersPerStudy_20Overall_cauchy_harmonizedEstimates.tsv.gz") %>%
+#   separate_wider_delim(total, delim="__", names=c("Pheno", "Gene")) %>%
+#   filter(Pheno=="Breast_cancer") %>%
+#   inner_join(genes, by="Gene")
+# 
+# data.table::fwrite(Jurgens_AoU_MGB, file="/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/AoU_MGB_All_breast_cancer.tsv")
+
+Jurgens_AoU_MGB <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/AoU_MGB_All_breast_cancer.tsv") %>% 
+  select(
+    Gene, SYMBOL, cases, controls, P_cauchy, P_cauchy_v2,
+    ends_with("hclof_noflag_POPMAX0.001"), # Meta with PTV
+    ends_with("missense0.2_POPMAX0.00001"), # Meta with rare missense
+    ends_with("hclof_noflag_missense0.8_POPMAX0.001"), ends_with("hclof_noflag_missense0.5_POPMAX0.001") # Meta with PTV_CADD and PTV_Helix
+    ) %>%
+  rename(popcases = cases, popcontrols=controls) %>%
+  pivot_longer(cols=contains("POPMAX"), names_to=c(".value", "raw_mask"),  names_sep="__") %>%
+  inner_join(mws %>% select(number_chrom, pos, SYMBOL) %>% distinct(), by="SYMBOL") %>%
+  filter(!is.na(P_Meta)) %>%
+  mutate(
+    P = P_Meta,
+    old_z = qnorm(p=P_Meta/2, lower.tail=FALSE),
+    z_score = Est_Meta/Est.SE_Meta,
+    oriented_beta = Est_Meta,
+    ID = SYMBOL
+    ) %>%
+  filter(!is.na(z_score))
+
+jurgens <- Jurgens_AoU_MGB %>%
+  filter(raw_mask != "hclof_noflag_missense0.5_POPMAX0.001") %>%
+  mutate(MASK = dplyr::case_when(
+    raw_mask == "hclof_noflag_POPMAX0.001" ~ "PTV",
+    raw_mask == "missense0.2_POPMAX0.00001" ~ "Rare",
+    raw_mask == "hclof_noflag_missense0.8_POPMAX0.001" ~ "PTV.CADD"
+    )
+  ) %>%
+  rbind(
+    Jurgens_AoU_MGB %>% 
+      filter(raw_mask == "hclof_noflag_missense0.8_POPMAX0.001") %>% 
+      mutate(MASK = "PTV.Helix")
+  ) %>%
+  mutate(
+    ID = paste0(SYMBOL, "_", MASK),
+    MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix"))
+    )
+
+data.table::fwrite(jurgens, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/jurgens.csv")
+
+```
+
+```{r}
+
+jurgens <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/jurgens.csv")
+
+```
+
+# Meta-analysis of MWS/BCAC/UKB/AoU/MGB
+
+```{r, eval=FALSE}
+
+combine <- mws %>% 
+  select(ID, SYMBOL, MASK, number_chrom, pos, P.mws = P, z_score.mws = z_score, oriented_beta.mws = oriented_beta) %>%
+  inner_join(
+    bcac %>% 
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.bcac = P, z_score.bcac = z_score, oriented_beta.bcac = oriented_beta), 
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) %>%
+  inner_join (
+    jurgens %>% 
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.jurgens = P, z_score.jurgens = z_score, oriented_beta.jurgens = oriented_beta), 
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) 
+
+weights <- combine %>% 
+  filter(SYMBOL == "CHEK2", MASK == "PTV") %>% 
+  mutate(
+    b = z_score.bcac / z_score.mws,
+    j = z_score.jurgens / z_score.mws,
+    m = 1) %>%
+  select(m, b, j) %>%
+  as.list()
+
+meta <- combine %>% 
+  mutate(
+    num = (z_score.mws * weights$m) + (z_score.bcac * weights$b) + (z_score.jurgens * weights$j),
+    denom = sqrt(weights$m^2 + weights$b^2 + weights$j^2),
+    z_score.meta = num/denom,
+    P.meta = 2*pnorm(q=-abs(z_score.meta))
+    ) %>%
+  select(-starts_with("weight_"), -num, -denom) %>%
+  pivot_longer(cols=c(starts_with("P."), starts_with("z_score."), starts_with("oriented_beta.")), 
+               names_sep="\\.", names_to=c(".value", "Study"))
+
+meta %>% arrange(P) %>% filter(Study=="meta", MASK=="PTV") %>% head(n=10)
+
+meta_ids <- meta %>% pull(ID) %>% unique()
+
+data.table::fwrite(meta, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta.csv")
+
+```
+
+```{r}
+
+meta <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta.csv")
+
+meta_ids <- meta %>% pull(ID) %>% unique()
+
+meta_sig <- meta %>% 
+  group_by(MASK) %>%
+  mutate(threshold = 0.05/n_distinct(SYMBOL)) %>%
+  select(MASK, threshold) %>% unique()
+
+```
+
+
+# White only
+
+```{r, eval=FALSE}
+
+regenie <- vector("list", 3)
+i <- 1
+for(file in c("rare", "cadd", "helix")) {
+  filename = paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/regenie/step2_gene/binary/breast_cancer_w_",
+                    file, "_breast_cancer_w.regenie")
+  data <- data.table::fread(filename)
+  
+  # Rearrange
+  data <- data %>% 
+    separate_wider_delim(cols=ID, delim=".", names=c("SYMBOL", "MASK", "FREQ"), too_many="merge", too_few="align_start") %>%
+    mutate(oriented_beta = BETA,
+           P = 10^(-LOG10P),
+           number_chrom=as.numeric(CHROM),
+           pos = GENPOS)
+  
+  if(file == "rare") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV", MASK == "M2" ~ "Rare", TRUE ~ "Uhoh"))
+    } else if(file == "cadd") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.CADD", MASK == "M2" ~ "CADD", TRUE ~ "Uhoh"))
+    } else if(file == "helix") {
+      data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.Helix", MASK == "M2" ~ "Helix", TRUE ~ "Uhoh"))
+    }
+  data <- data %>% mutate(ID = paste0(SYMBOL, "_", MASK, "_", FREQ, "_", TEST))
+  regenie[[i]] <- data
+  i <- i + 1
+}
+
+mws_w <- dplyr::bind_rows(regenie) %>% 
+  filter(
+    FREQ == "all",
+    TEST == "ADD",
+    MASK %in% c("PTV", "Rare", "PTV.CADD", "PTV.Helix")
+  ) %>%
+  mutate(
+    ID = paste0(SYMBOL, "_", MASK),
+    z_score = BETA/SE,
+    MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix"))
+    )
+  
+rm(regenie)
+
+data.table::fwrite(mws_w, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws_w.csv")
+
+```
+
+```{r}
+
+mws_w <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws_w.csv")
+
+```
+
+```{r}
+
+bcac <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/bcac.csv")
+
+```
+
+```{r, eval=FALSE}
+
+# dbname <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/annotation/anno_full.db"
+# con <- DBI::dbConnect(duckdb::duckdb(), dbname)
+# 
+# colnames <- tbl(con, "annotation") %>% head() %>% collect()
+# 
+# genes <- tbl(con, "annotation") %>%
+#   filter(Feature_type == "Transcript",
+#          (is.na(MANE_SELECT) & CANONICAL == "YES") | !is.na(MANE_SELECT),
+#          BIOTYPE == "protein_coding"
+#          ) %>%
+#   select(Gene, SYMBOL) %>%
+#   distinct() %>%
+#   collect()
+# 
+# DBI::dbDisconnect(con, shutdown=TRUE)
+# 
+# Jurgens_AoU_MGB <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/JurgensWang2024_all_files/All_EU_raw/AoU_250k_MGB_53k__10CarriersPerStudy_20Overall_cauchy_harmonizedEstimates.tsv.gz") %>%
+#   separate_wider_delim(total, delim="__", names=c("Pheno", "Gene")) %>%
+#   filter(Pheno=="Breast_cancer") %>%
+#   inner_join(genes, by="Gene")
+# 
+# data.table::fwrite(Jurgens_AoU_MGB, file="/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/AoU_MGB_EU_breast_cancer.tsv")
+
+Jurgens_AoU_MGB <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jurgens2024/AoU_MGB_EU_breast_cancer.tsv") %>% 
+  select(
+    Gene, SYMBOL, cases, controls, P_cauchy, P_cauchy_v2,
+    ends_with("hclof_noflag_POPMAX0.001"), # Meta with PTV
+    ends_with("missense0.2_POPMAX0.00001"), # Meta with rare missense
+    ends_with("hclof_noflag_missense0.8_POPMAX0.001"), ends_with("hclof_noflag_missense0.5_POPMAX0.001") # Meta with PTV_CADD and PTV_Helix
+    ) %>%
+  rename(popcases = cases, popcontrols=controls) %>%
+  pivot_longer(cols=contains("POPMAX"), names_to=c(".value", "raw_mask"),  names_sep="__") %>%
+  inner_join(mws %>% select(number_chrom, pos, SYMBOL) %>% distinct(), by="SYMBOL") %>%
+  filter(!is.na(P_Meta)) %>%
+  mutate(
+    P = P_Meta,
+    old_z = qnorm(p=P_Meta/2, lower.tail=FALSE),
+    z_score = Est_Meta/Est.SE_Meta,
+    oriented_beta = Est_Meta,
+    ID = SYMBOL
+    ) %>%
+  filter(!is.na(z_score))
+
+jurgens_w <- Jurgens_AoU_MGB %>%
+  filter(raw_mask != "hclof_noflag_missense0.5_POPMAX0.001") %>%
+  mutate(MASK = dplyr::case_when(
+    raw_mask == "hclof_noflag_POPMAX0.001" ~ "PTV",
+    raw_mask == "missense0.2_POPMAX0.00001" ~ "Rare",
+    raw_mask == "hclof_noflag_missense0.8_POPMAX0.001" ~ "PTV.CADD"
+    )
+  ) %>%
+  rbind(
+    Jurgens_AoU_MGB %>% 
+      filter(raw_mask == "hclof_noflag_missense0.8_POPMAX0.001") %>% 
+      mutate(MASK = "PTV.Helix")
+  ) %>%
+  mutate(ID = paste0(SYMBOL, "_", MASK))
+
+data.table::fwrite(jurgens_w, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/jurgens_w.csv")
+
+```
+
+```{r}
+
+jurgens_w <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/jurgens_w.csv")
+
+```
+
+## Meta-analysis of MWS/BCAC/UKB/AoU/MGB
+
+```{r, eval=FALSE}
+
+combine <- mws_w %>% 
+  select(ID, SYMBOL, MASK, number_chrom, pos, P.mws = P, z_score.mws = z_score, oriented_beta.mws = oriented_beta) %>%
+  inner_join(
+    bcac %>%
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.bcac = P, z_score.bcac = z_score, oriented_beta.bcac = oriented_beta),
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) %>%
+  inner_join (
+    jurgens_w %>% 
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.jurgens = P, z_score.jurgens = z_score, oriented_beta.jurgens = oriented_beta), 
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) 
+
+weights <- combine %>% 
+  filter(SYMBOL == "CHEK2", MASK == "PTV") %>% 
+  mutate(
+    b = z_score.bcac / z_score.mws,
+    j = z_score.jurgens / z_score.mws,
+    m = 1) %>%
+  select(m, j, b) %>% 
+  as.list()
+
+meta_w <- combine %>% 
+  mutate(
+    num = (z_score.mws * weights$m) + (z_score.jurgens * weights$j) + (z_score.bcac * weights$b),
+    denom = sqrt(weights$m^2 + weights$j^2 + weights$b^2), 
+    z_score.meta = num/denom,
+    P.meta = 2*pnorm(q=-abs(z_score.meta))
+    ) %>%
+  select(-starts_with("weight_"), -num, -denom) %>%
+  pivot_longer(cols=c(starts_with("P."), starts_with("z_score."), starts_with("oriented_beta.")), 
+               names_sep="\\.", names_to=c(".value", "Study"))
+
+data.table::fwrite(meta_w, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta_w.csv")
+
+```
+
+```{r}
+
+meta_w %>% 
+  filter(Study == "meta",
+         MASK == "PTV",
+         P < 1e-5
+         )%>%
+  arrange(MASK, P) %>% 
+  mutate(
+    Zscore = formatC(z_score, digits=2, format="f"),
+    Pval = formatC(P, digits=2, format="e")
+    ) %>%
+  select(MASK, SYMBOL, Zscore, Pval)
+
+```
+
+```{r}
+
+meta_w <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta_w.csv")
+
+```
+
+# Sensitivity and supplementary analyses
+
+```{r, eval=FALSE}
+
+read_burden <- function(pheno) {
+  regenie <- vector("list", 3)
+  i <- 1
+  for(file in c("rare", "cadd", "helix")) {
+    filename = paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/regenie/step2_gene/binary/",
+    pheno, "_", file, "_", pheno, ".regenie")
+    data <- data.table::fread(filename)
+    
+    # Rearrange
+    data <- data %>% 
+      separate_wider_delim(cols=ID, delim=".", names=c("SYMBOL", "MASK", "FREQ"), too_many="merge", too_few="align_start") %>%
+      mutate(oriented_beta = BETA,
+             P = 10^(-LOG10P),
+             number_chrom=as.character(CHROM),
+             pos = GENPOS)
+    
+    if(file == "rare") {
+        data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV", MASK == "M2" ~ "Rare", TRUE ~ "Uhoh"))
+      } else if(file == "cadd") {
+        data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.CADD", MASK == "M2" ~ "CADD", TRUE ~ "Uhoh"))
+      } else if(file == "helix") {
+        data <- data %>% mutate(MASK = dplyr::case_when(MASK == "M1" ~ "PTV.Helix", MASK == "M2" ~ "Helix", TRUE ~ "Uhoh"))
+      }
+    data <- data %>% 
+      filter(
+        FREQ == "all",
+        TEST == "ADD",
+        MASK %in% c("PTV", "Rare", "PTV.CADD", "PTV.Helix")
+      ) %>% 
+      mutate(
+        ID = paste0(SYMBOL, "_", MASK),
+        z_score = BETA/SE
+        )
+    
+    regenie[[i]] <- data
+    i <- i + 1
+  }
+  
+  mws <- dplyr::bind_rows(regenie) %>% mutate(MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix")))
+    
+  rm(regenie)
+  return(mws)
+}
+
+breast_cancer_burden <- read_burden("breast_cancer")
+breast_cancer_w_burden <- read_burden("breast_cancer_w")
+breast_cancer_insitu_burden <- read_burden("breast_cancer_insitu")
+bc_noCVD_burden <- read_burden("bc_noCVD_controls")
+bc_before_55_burden <- read_burden("bc_before_55")
+bc_after_55_burden <- read_burden("bc_after_55")
+bc_screen_burden <- read_burden("bc_screen")
+bc_interval_burden <- read_burden("bc_interval")
+bc_withFH_strat_burden <- read_burden("bc_withFH_strat")
+bc_noFH_strat_burden <- read_burden("bc_noFH_strat")
+
+all_burden <- bind_rows(
+  list(
+    mws_breast_cancer=breast_cancer_burden, 
+    overall_breast_cancer=breast_cancer_burden,
+    breast_cancer_finn=breast_cancer_burden %>% filter(MASK == "PTV"),
+    breast_cancer_w=breast_cancer_w_burden, 
+    breast_cancer_insitu=breast_cancer_insitu_burden, 
+    bc_noCVD=bc_noCVD_burden,
+    bc_before_55=bc_before_55_burden,
+    bc_after_55=bc_after_55_burden,
+    bc_screen=bc_screen_burden, 
+    bc_interval=bc_interval_burden,
+    bc_withFH_strat=bc_withFH_strat_burden,
+    bc_noFH_strat=bc_noFH_strat_burden
+    ), 
+  .id="Analysis"
+  )
+
+data.table::fwrite(all_burden, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/supplementary.csv")
+
+```
+
+```{r}
+
+all_burden <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/supplementary.csv")
+
+```
+
+
+# Case/control carrier counts by burden mask (not individual variants)
+
+```{r, eval=FALSE}
+
+carrier_count <- function(phenotype, burden_results) {
+  masks <- c("PTV", "Rare", "PTV.CADD", "PTV.Helix")
+  pheno <-data.table::fread(paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/phenofiles/", phenotype, "_pheno.txt")) %>% 
+    select(-FID)
+  
+  variant_list  <- vector("list", 4)
+  names(variant_list) <- masks
+  
+  for (mask in masks) {
+    name <- dplyr::case_when(
+      mask %in% c("PTV", "Rare") ~ "rare",
+      mask == "PTV.CADD" ~ "cadd",
+      mask == "PTV.Helix" ~ "helix",
+      TRUE ~ "Oops"
+    )
+    mask_file <- paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/regenie/step2_gene/binary/", phenotype, "_", name, "_masks")
+
+    file_masks <- c("PTV" = "M1", "Rare" = "M2", "PTV.CADD" = "M1", "PTV.Helix" = "M1")
+    
+    sig_genes <- burden_results %>%
+      filter(MASK == mask, P < 0.001) %>%
+      pull(SYMBOL) %>%
+      unique()
+    
+    genes <- data.table::fread(paste0(mask_file, ".bim"), col.names=c("CHR", "ID", "POS", "BP", "A1", "REF")) %>%
+      separate_wider_delim(cols=ID, delim=".", names=c("SYMBOL", "MASK", "FREQ"), too_many="merge", cols_remove=FALSE) %>%
+      filter(
+        FREQ == "all", 
+        SYMBOL %in% sig_genes, 
+        MASK == file_masks[[mask]])
+    
+    if(nrow(genes) > 0) {
+      raw_genes <- extract_variants_bfile(
+        genes %>% pull(ID), 
+        bfile = mask_file,
+        plink_bin = config$software$plink2
+        )
+      
+      variants <- as.data.frame(raw_genes) %>%
+        select(-FID, -PAT, -MAT, -SEX, -PHENOTYPE) %>%
+        mutate(across(contains("ref"), ~2-as.numeric(.x))) %>%
+        pivot_longer(cols=contains("ref"), names_to="ID", values_to="carrier") %>%
+        separate_wider_delim(cols=ID, delim=".", names=c("SYMBOL"), too_many="drop")
+  
+      variant_list[[mask]] <- variants
+    } else {
+      variant_list[[mask]] <- NULL
+    }
+    
+  }
+  
+  rm(raw_genes)
+  rm(variants)
+  
+  all_burden <- bind_rows(variant_list, .id="MASK") %>% 
+    inner_join(pheno, by="IID") %>%
+    filter(!is.na(carrier)) %>%
+    mutate(
+      MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix")),
+      status = factor(.data[[phenotype]], levels=c(1, 2), labels=c("control", "case"))
+      ) %>%
+    select(IID, SYMBOL, MASK, status, carrier)
+  
+  rm(variant_list)
+  
+  return(all_burden)
+}
+
+mws_breast_cancer_counts <- carrier_count("breast_cancer_insitu", burden_results = breast_cancer_burden)
+
+meta <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta.csv")
+overall_breast_cancer_counts <- carrier_count("breast_cancer", burden_results = meta %>% filter(Study == "meta"))
+
+meta_finn <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta_finn.csv")
+breast_cancer_finn_counts <- carrier_count("breast_cancer", burden_results = meta_finn %>% filter(Study == "meta"))
+
+meta_w <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta_w.csv")
+breast_cancer_w_counts <- carrier_count("breast_cancer_w", burden_results = meta_w %>% filter(Study == "meta"))
+
+breast_cancer_insitu_counts <- carrier_count("breast_cancer_insitu", burden_results = breast_cancer_insitu_burden)
+bc_noCVD_counts <- carrier_count("bc_noCVD_controls", burden_results = bc_noCVD_burden)
+bc_before_55_counts <- carrier_count("bc_before_55", burden_results = rbind(bc_before_55_burden, bc_after_55_burden))
+bc_after_55_counts <- carrier_count("bc_after_55", burden_results = rbind(bc_before_55_burden, bc_after_55_burden))
+bc_screen_counts <- carrier_count("bc_screen", burden_results = rbind(bc_screen_burden, bc_interval_burden))
+bc_interval_counts <- carrier_count("bc_interval", burden_results = rbind(bc_screen_burden, bc_interval_burden))
+bc_withFH_strat_counts <- carrier_count("bc_withFH_strat", burden_results = rbind(bc_withFH_strat_burden, bc_noFH_strat_burden))
+bc_noFH_strat_counts <- carrier_count("bc_noFH_strat", burden_results = rbind(bc_withFH_strat_burden, bc_noFH_strat_burden))
+
+all_counts <- bind_rows(
+  list(
+    mws_breast_cancer=mws_breast_cancer_counts,
+    overall_breast_cancer=overall_breast_cancer_counts,
+    breast_cancer_finn=breast_cancer_finn_counts,
+    breast_cancer_w=breast_cancer_w_counts, 
+    breast_cancer_insitu=breast_cancer_insitu_counts,
+    bc_noCVD=bc_noCVD_counts,
+    bc_before_55=bc_before_55_counts, 
+    bc_after_55=bc_after_55_counts,
+    bc_screen=bc_screen_counts, 
+    bc_interval=bc_interval_counts,
+    bc_withFH_strat=bc_withFH_strat_counts,
+    bc_noFH_strat=bc_noFH_strat_counts
+    ), 
+  .id="Analysis")
+
+carrier_counts <- all_counts %>% 
+  group_by(Analysis, MASK, SYMBOL) %>% 
+  summarise(
+    control_noncarriers = sum(status == "control" & carrier == 0),
+    control_carriers = sum(status == "control" & carrier != 0), 
+    case_noncarriers = sum(status == "case" & carrier == 0),
+    case_carriers = sum(status == "case" & carrier != 0)
+    ) %>% 
+  arrange(Analysis, MASK, SYMBOL)
+
+carrier_counts
+
+```
+
+## Tables
+
+```{r}
+
+format_pct <- function(pct) {
+  if(pct < 0.01) {
+    pretty_pct <- "<0.01"
+  } else {
+    pretty_pct <- formatC(pct, digits=2, format="f")
+  }
+  return(pretty_pct)
+}
+
+all_table <- all_burden %>% 
+  select(Analysis, CHROM, SYMBOL, MASK, BETA, SE, P, z_score) %>%
+  mutate(
+    OR = formatC(exp(BETA), digits=2, format="f"),
+    LCI = formatC(exp(BETA - 1.96*SE), digits=2, format="f"),
+    UCI = formatC(exp(BETA + 1.96*SE), digits=2, format="f"),
+    OR_CI = paste0(OR, "\n(", LCI, ", ", UCI, ")"),
+    # Zscore = formatC(z_score, digits=2, format="f"),
+    Pval = formatC(P, digits=2, format="e"),
+    MASK = factor(MASK, levels=c("PTV", "Rare", "PTV.CADD", "PTV.Helix"))
+    ) %>%
+  inner_join(carrier_counts, by=c("Analysis", "MASK", "SYMBOL")) %>%
+  mutate(
+    control_pct = 100 * control_carriers / (control_carriers + control_noncarriers),
+    case_pct = 100 * case_carriers / (case_carriers + case_noncarriers),
+    control_pct = map(control_pct, format_pct),
+    case_pct = map(case_pct, format_pct),
+    control_carriers = paste0(control_carriers, "\n(", control_pct, "%)"),
+    case_carriers = paste0(case_carriers, "\n(", case_pct, "%)")
+    ) %>%
+  arrange(Analysis, MASK, P) %>%
+  select(Analysis, MASK, SYMBOL, control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval, P)
+
+```
+
+```{r}
+
+############
+# MWS only #
+############
+
+mws_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis == "mws_breast_cancer", P < 0.001) %>%
+  arrange(MASK, P) %>%
+  select(MASK, SYMBOL, OR_CI, Pval)
+  
+list_of_mws <- list(mws=mws_analyses)
+
+#################
+# Main analyses #
+#################
+
+main_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis == "overall_breast_cancer") %>%
+  select(-P) %>%
+  inner_join(
+    meta %>% 
+      filter(Study == "meta", P < 0.001) %>% 
+      mutate(P.meta = formatC(P, digits=2, format="e"),
+             Z.meta = formatC(z_score, digits=2, format="f")) %>%
+      select(MASK, SYMBOL, P.m=P, Z.meta, P.meta),
+    by=c("MASK", "SYMBOL")
+  ) %>%
+  arrange(MASK, P.m) %>%
+  select(Analysis, MASK, SYMBOL, control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval, Z.meta, P.meta)
+  
+list_of_main <- split(main_analyses, main_analyses$MASK) %>%
+  lapply(., function(x) {x %>% select(-Analysis, -MASK)})
+
+####################
+# PTV with FinnGen #
+####################
+
+finn_analysis <- all_table %>%
+  ungroup() %>%
+  filter(Analysis == "breast_cancer_finn") %>%
+  select(-P) %>%
+  inner_join(
+    meta_finn %>% 
+      filter(Study == "meta", P < 0.001) %>% 
+      mutate(P.meta = formatC(P, digits=2, format="e"),
+             Z.meta = formatC(z_score, digits=2, format="f")) %>%
+      select(MASK, SYMBOL, P.m=P, Z.meta, P.meta),
+    by=c("MASK", "SYMBOL")
+  ) %>%
+  arrange(MASK, P.m) %>%
+  mutate(MASK = paste0(Analysis, ".", MASK)) %>%
+  select(Analysis, MASK, SYMBOL, control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval, Z.meta, P.meta)
+  
+list_of_finn <- split(finn_analysis, finn_analysis$MASK, drop=TRUE) %>%
+  lapply(., function(x) {x %>% select(-Analysis, -MASK)})
+
+###############################
+# Dichotomous supplementaries #
+###############################
+
+agestrat_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis %in% c("bc_before_55", "bc_after_55")) %>%
+  select(-P) %>%
+  arrange(desc(Analysis)) %>%
+  pivot_wider(
+    names_from=Analysis, 
+    values_from=c(control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval)) %>%
+  select(MASK, SYMBOL, ends_with("before_55"), ends_with("after_55")) %>%
+  mutate(Analysis = "age_strat")
+
+list_of_agestrat <- split(agestrat_analyses, 
+                             list(agestrat_analyses$Analysis, agestrat_analyses$MASK), 
+                             drop=TRUE, lex.order = TRUE) %>%
+  lapply(., function(x) {x %>% select(-Analysis, -MASK)})
+
+screenstrat_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis %in% c("bc_screen", "bc_interval")) %>%
+  select(-P) %>%
+  arrange(desc(Analysis)) %>%
+  pivot_wider(
+    names_from=Analysis, 
+    values_from=c(control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval)) %>%
+  select(MASK, SYMBOL, ends_with("bc_screen"), ends_with("bc_interval")) %>%
+  mutate(Analysis = "screen_strat")
+
+list_of_screenstrat <- split(screenstrat_analyses, 
+                             list(screenstrat_analyses$Analysis, screenstrat_analyses$MASK), 
+                             drop=TRUE, lex.order = TRUE) %>%
+  lapply(., function(x) {x %>% select(-Analysis, -MASK)})
+
+FHstrat_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis %in% c("bc_withFH_strat", "bc_noFH_strat")) %>%
+  select(-P) %>%
+    arrange(Analysis) %>%
+  pivot_wider(
+    names_from=Analysis,
+    values_from=c(control_noncarriers, control_carriers, case_noncarriers, case_carriers, OR_CI, Pval)) %>%
+  select(MASK, SYMBOL, ends_with("bc_noFH_strat"), ends_with("bc_withFH_strat")) %>%
+  mutate(Analysis = "FH_strat")
+
+list_of_FHstrat <- split(FHstrat_analyses,
+                             list(FHstrat_analyses$Analysis, FHstrat_analyses$MASK),
+                             drop=TRUE, lex.order = TRUE) %>%
+  lapply(., function(x) {x %>% select(-Analysis, -MASK)})
+
+##############
+# White meta #
+##############
+
+white_analyses <- meta %>% 
+  filter(Study == "meta") %>% 
+  mutate(P.meta = formatC(P, digits=2, format="e"),
+         Z.meta = formatC(z_score, digits=2, format="f")) %>%
+  select(MASK, SYMBOL, P.m=P, Z.meta, P.meta) %>%
+  full_join(
+    meta_w %>% 
+      filter(Study == "meta") %>% 
+      mutate(P.eur = formatC(P, digits=2, format="e"),
+             Z.eur = formatC(z_score, digits=2, format="f")) %>%
+      select(MASK, SYMBOL, P.w=P, P.eur, Z.eur),
+    by=c("MASK", "SYMBOL")
+  ) %>%
+  filter(P.m < 0.001 | P.w < 0.001) %>%
+  arrange(MASK, P.m, P.w) %>%
+  select(MASK, SYMBOL, Z.meta, P.meta, Z.eur, P.eur)
+  
+list_of_white <- list(Euro = white_analyses)
+
+#######################
+# Other supplementary #
+#######################
+
+supplementary_analyses <- all_table %>%
+  ungroup() %>%
+  filter(Analysis %in% c("breast_cancer_insitu", "bc_noCVD")) %>%
+  select(Analysis, MASK, SYMBOL, OR_CI, Pval)
+
+list_of_supplementary <- split(supplementary_analyses,
+                             list(supplementary_analyses$Analysis),
+                             drop=TRUE, lex.order = TRUE) %>%
+  lapply(., function(x) {x %>% select(-Analysis)})
+
+# Combine
+
+list_of_datasets <- c(list_of_mws, list_of_main, list_of_finn, 
+                      list_of_agestrat, list_of_screenstrat, list_of_FHstrat,
+                      list_of_white, list_of_supplementary)
+
+openxlsx::write.xlsx(list_of_datasets, file = "/home/jenniferco/MWS/Manuscript/Tables/SupplementaryUnformatted.xlsx", vdpi=300)
+
+```
+

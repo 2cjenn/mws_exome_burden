@@ -1,0 +1,236 @@
+---
+title: "FinnGen"
+author: "Jennifer Collister"
+date: "04/10/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(qqman)
+library(ggpubr)
+library(janitor)
+library(ggrepel)
+library(forcats)
+library(tictoc)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+# Source shared functions
+source(config$scripts$shared)
+
+
+```
+
+# Read in FinnGen summary data
+
+Browse in https://r12.finngen.fi/lof/
+
+Download from [google cloud bucket](https://console.cloud.google.com/storage/browser/finngen-public-data-r12/lof?inv=1&invt=AbkWfA&pageState=(%22StorageObjectListTable%22:(%22f%22:%22%255B%255D%22)))
+
+```{r}
+
+# Downloaded from google cloud bucket
+finngen <- data.table::fread("/home/jenniferco/data/FinnGen/R12/lof_data_finngen_R12_lof.txt.gz") 
+head(finngen)
+
+finngen <- finngen %>%
+  filter(str_detect(toupper(PHENO), "BREAST"))
+
+table(finngen$PHENO)
+
+finngen %>% filter(PHENO == "C3_BREAST_EXALLC") %>% mutate(P = 10^(-LOG10P)) %>% arrange(P) #%>% select(ID, BETA, P)
+finngen %>% filter(PHENO == "C3_BREAST_ERPLUS_EXALLC") %>% mutate(P = 10^(-LOG10P)) %>% arrange(P) %>% select(ID, BETA, P)
+
+```
+
+Looks like 
+
+* FinnGen burden tests were conducted using Regenie
+* The available phenotypes include subtypes (ERPLUS, ERNEG)
+* All the N diagnoses are other disorders
+
+Phenotype of main interest = [C3_BREAST_EXALLC](https://risteys.finregistry.fi/endpoints/C3_BREAST_EXALLC)
+
+This is excluding all other cancers - there isn't a phenotype that doesn't.
+
+```{r}
+
+finn <- finngen %>% 
+  filter(PHENO %in% c("C3_BREAST_EXALLC", "C3_BREAST_ERPLUS_EXALLC")) %>%
+  separate_wider_delim(ID, delim=".Mask1.", names=c("SYMBOL", "FREQ"), too_many="merge") %>%
+  mutate(
+    MASK = "PTV",
+    z_score = BETA/SE,
+    P = 10^(-LOG10P),
+    ID = paste0(SYMBOL, "_", MASK)
+    ) %>%
+  rename(number_chrom = CHROM,
+         pos = GENPOS)
+
+head(finn)
+
+table(finn$number_chrom)
+
+```
+
+# Read MWS, BCAC/UKB and AoU/MGC
+
+```{r}
+
+mws <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/mws.csv") %>%
+  filter(MASK == "PTV")
+bcac <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/bcac.csv") %>%
+  filter(MASK == "PTV")
+jurgens <- data.table::fread("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/jurgens.csv") %>%
+  filter(MASK == "PTV")
+
+```
+
+# Compare list of genes
+
+```{r}
+
+genes <- finn %>% select(SYMBOL, number_chrom, pos) %>% inner_join(mws %>% filter(MASK=="PTV", FREQ=="0.001") %>% select(SYMBOL, chr = number_chrom, p = pos), by="SYMBOL")
+
+```
+
+
+# Meta-analysis of MWS/BCAC/UKB/AoU/MGB/FG
+
+```{r}
+
+combine <- mws %>% 
+  select(ID, SYMBOL, MASK, number_chrom, pos, P.mws = P, z_score.mws = z_score) %>%
+  inner_join(
+    bcac %>% 
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.bcac = P, z_score.bcac = z_score), 
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) %>%
+  inner_join (
+    jurgens %>% 
+      select(ID, SYMBOL, MASK, number_chrom, pos, P.jurgens = P, z_score.jurgens = z_score), 
+    by=c("ID", "SYMBOL", "MASK", "number_chrom", "pos")
+    ) %>%
+  inner_join (
+    finn %>%
+      filter(PHENO == "C3_BREAST_EXALLC") %>%
+      select(ID, SYMBOL, MASK, number_chrom, finn_pos = pos, P.finngen = P, z_score.finngen = z_score),
+    by=c("ID", "SYMBOL", "MASK", "number_chrom")
+  )
+
+weights <- combine %>% 
+  filter(SYMBOL == "CHEK2", MASK == "PTV") %>% 
+  mutate(
+    b = z_score.bcac / z_score.mws,
+    j = z_score.jurgens / z_score.mws,
+    f = z_score.finngen / z_score.mws,
+    m = 1) %>%
+  select(m, b, j, f) %>%
+  as.list()
+
+meta_finn <- combine %>% 
+  mutate(
+    num = (z_score.mws * weights$m) + (z_score.bcac * weights$b) + (z_score.jurgens * weights$j) + (z_score.finngen * weights$f),
+    denom = sqrt(weights$m^2 + weights$b^2 + weights$j^2 + weights$f^2),
+    z_score.meta = num/denom,
+    P.meta = 2*pnorm(q=-abs(z_score.meta)),
+    oriented_beta = NA
+    ) %>%
+  select(-starts_with("weight_"), -num, -denom) %>%
+  pivot_longer(cols=c(starts_with("P."), starts_with("z_score.")), names_sep="\\.", names_to=c(".value", "Study"))
+
+head(meta_finn)
+
+meta_ids <- meta_finn %>% pull(ID) %>% unique()
+
+meta_pos <- meta_finn %>% select(number_chrom, pos, finn_pos) %>% distinct() %>% mutate(diff = finn_pos - pos)
+head(meta_pos)
+ggplot(aes(x=pos, y=finn_pos, color=number_chrom), data=meta_pos) + geom_point()
+
+meta_finn %>% filter(is.na(SYMBOL))
+
+data.table::fwrite(meta_finn, "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/meta/data/meta_finn.csv")
+
+```
+
+# Manhattan plots
+
+```{r}
+
+masks <- c("PTV")
+mask_labels <- c(PTV = "PTV")
+datasets <- list("MWS" = "mws", "BCAC.UKB" = "bcac", "AoU.MGB" = "jurgens", "FinnGen" = "finngen", "Meta" = "meta")
+colours <- c("MWS" = "#FF0000", "BCAC.UKB" = "#0047AB", "AoU.MGB" = "#097969", "FinnGen" = "#AB4400", "Meta" = "#000068")
+
+tablist <- list(PTV=NULL)
+
+for(mask in masks) {
+  
+  mask_data <- meta %>% filter(MASK==mask)
+  
+  pval_list <- list(MWS=NULL, BCAC.UKB=NULL, AoU.MGB=NULL, FinnGen=NULL, Meta=NULL)
+  
+  n_gene <- mask_data %>% select(SYMBOL) %>% n_distinct()
+  sig <- 0.05/n_gene
+  
+  min_p <- mask_data %>% pull(P) %>% min()
+  ylim <- abs(floor(log10(min_p))) + 2
+  
+  gene_list <- NULL
+  
+  meta_genes <- mask_data %>% 
+    filter(Study=="meta", P < sig) %>% 
+    arrange(P) %>%
+    pull(SYMBOL)
+  
+  for (dataset in names(datasets)) {
+    print(paste0(mask, ", ", dataset))
+    
+    study_data <- mask_data %>% filter(Study == datasets[[dataset]])
+    
+    regenie_man_plot <- manplot_func(
+      sum_stats = study_data %>% mutate(number_chrom=as.character(number_chrom)), 
+      trait_name=paste0(mask, " variants"),
+      gene_based=TRUE,
+      sig = sig,
+      ylim = ylim,
+      highlight_color = colours[dataset],
+      gene_list = gene_list,
+      title_text=paste0(mask_labels[mask], " variants in ", dataset, " with sig=", formatC(sig, format = "e", digits = 2))
+      )
+    
+    tiff(paste0("/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/figs/genebased_meta/finngen/", dataset, "_", mask, "_Manhattan.tiff"), 
+         units="in", width=8, height=7, res=300)
+    print(regenie_man_plot)
+    dev.off()
+    
+    pval_list[[dataset]] <- study_data %>% 
+      filter(SYMBOL %in% meta_genes) %>% 
+      select(SYMBOL, P) %>%
+      arrange(P) %>%
+      mutate("{dataset}" := formatC(P, format = "e", digits = 2)) %>%
+      select(-P)
+  }
+  tablist[[mask]] <- pval_list %>% purrr::reduce(left_join, by = "SYMBOL")
+}
+
+```
+

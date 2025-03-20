@@ -1,0 +1,253 @@
+---
+title: "RunRegenie"
+author: "Jennifer Collister"
+date: "10/25/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+library(yaml)
+library(here)
+library(data.table)
+library(R.utils)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(qqman)
+library(ggpubr)
+library(janitor)
+library(ggrepel)
+library(forcats)
+library(DBI)
+library(duckdb)
+library(dbplyr)
+library(tictoc)
+library(glue)
+
+knitr::opts_chunk$set(echo = TRUE)
+# Set the root directory to the project directory (otherwise knitr works in the directory of the Rmd file by default)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the project config file for filepaths etc
+config = read_yaml(here::here("./config.yml"))
+
+# Specify a safe tmp dir
+unixtools::set.tempdir(config$tmp)
+
+# Source shared functions
+source(config$scripts$shared)
+
+```
+
+# Run Regenie
+
+Universal parameters
+
+```{r}
+
+outpath <- "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/regenie"
+
+universal <- list(
+  regenie = "/home/jenniferco/software/regenie_v3.4.1.gz_x86_64_Centos7_mkl",
+  bedpath_gxs = "/shared/MWS_Regeneron_Data/MWS_regeneron/pVCF/GxS_PLINK/OXFORD-MWS_Freeze_One.GxS",
+  bedpath_exome = "/shared/MWS_Regeneron_Data/MWS_regeneron/pVCF/exome_PLINK/REGENIE_FILES/OXFORD-MWS_Freeze_One.norm",
+  pruned = "/shared/MWS_Regeneron_Data/MWS_regeneron/REGENIE_FILES/ld_pruned.prune.in",
+  phenopath = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/phenofiles",
+  covarfile = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/exwas/covarfile/covars.txt",
+  mask_path = "/shared/MWS_Regeneron_Data/MWS_regeneron/Jennifer/summaryQC/backman2021/masks",
+  outpath = outpath,
+  step1_out = file.path(outpath, "step1"),
+  step2_exwas = file.path(outpath, "step2_exwas"),
+  step2_gene = file.path(outpath, "step2_gene")
+)
+
+```
+
+Trait specific parameters
+
+```{r}
+
+binary_param <- list(
+  pheno_cols = c(
+    "breast_cancer",
+    "breast_cancer_w",
+    "breast_cancer_insitu",
+    "bc_noCVD_controls",
+    "bc_before_55",
+    "bc_after_55",
+    "bc_screen",
+    "bc_interval",
+    "bc_withFH_strat",
+    "bc_noFH_strat"
+    ), 
+  covar_cols = paste(c(
+    "Age",
+    "pc1", "pc2", "pc3", "pc4", "pc5",
+    "pc6", "pc7", "pc8", "pc9", "pc10"
+  ), collapse=","),
+  trait = "--bt --cc12",
+  firth = "--firth --approx",
+  out = "binary"
+)
+
+continuous_param <- list(
+  pheno_cols = c(
+    "age_breast_cancer"
+    ), 
+  covar_cols = paste(c(
+    "pc1", "pc2", "pc3", "pc4", "pc5",
+    "pc6", "pc7", "pc8", "pc9", "pc10"
+  ), collapse=","),
+  trait = "--qt",
+  firth = "",
+  out = "continuous"
+)
+
+```
+
+Run using screen to launch detached sessions from within R.
+
+`screen -dm -S [name] [cmd]`
+
+* `-d` = detached
+* `-m` = completely detached
+* `-S` = name
+
+Use `ionice -c2 -n7 nice` as requested by Dave to play nice on Morpheus.
+
+## Step 1
+
+```{r}
+
+command_list <- list()
+
+for (param_set in list(binary_param, continuous_param)) {
+  print(param_set[['out']])
+  
+  for(pheno in param_set[["pheno_cols"]]) {
+    print(pheno)
+    pheno_file <- file.path(universal$phenopath, paste0(pheno, "_pheno.txt"))
+    outpath <- file.path(universal[['step1_out']], param_set[['out']], pheno)
+    
+    regenie_cmd <- glue(
+      "ionice -c2 -n7 nice",
+      "{universal[['regenie']]}",
+      "--step 1",
+      "--bed {universal[['bedpath_gxs']]}",
+      "--extract {universal[['pruned']]}",
+      "--phenoFile {pheno_file}",
+      "--phenoColList {pheno}",
+      "--covarFile {universal[['covarfile']]}",
+      "--covarColList {param_set[['covar_cols']]}",
+      "{param_set[['trait']]}",
+      "--bsize 1000 --threads 16",
+      "--out {outpath}",
+      .sep = " "
+    )
+    command_list[[pheno]] <- regenie_cmd
+  }
+}
+
+run <- paste0("screen -dmS step1 ionice -c2 -n7 nice bash -c '", paste(command_list, collapse=" && "), "'")
+run
+system(run)
+
+```
+
+(Running all of these at once without `ionice` kinda tanked Morpheus, they were all nomming too much CPU)
+
+## Step 2 ExWAS
+
+```{r}
+
+command_list <- list()
+
+for (param_set in list(binary_param, continuous_param)) {
+  print(param_set[['out']])
+  
+  for(pheno in param_set[["pheno_cols"]]) {
+    print(pheno)
+    pheno_file <- file.path(universal$phenopath, paste0(pheno, "_pheno.txt"))
+    outpath <- file.path(universal[['step2_exwas']], param_set[['out']], pheno)
+    
+    regenie_cmd <- glue(
+      "{universal[['regenie']]}",
+      "--step 2",
+      "--bed {universal[['bedpath_exome']]}",
+      "--phenoFile {pheno_file}",
+      "--phenoColList {pheno}",
+      "--covarFile {universal[['covarfile']]}",
+      "--covarColList {param_set[['covar_cols']]}",
+      "--pred {file.path(universal[['step1_out']], param_set[['out']], pheno)}_pred.list",
+      "{param_set[['trait']]} {param_set[['firth']]} --pThresh 0.01 --af-cc",
+      "--bsize 400 --threads 16",
+      "--out {outpath}",
+      "--chrList 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23",
+      .sep = " "
+    )
+    command_list[[pheno]] <- regenie_cmd
+  }
+}
+run <- paste0("screen -dmS step2_exwas ionice -c2 -n7 nice bash -c '", paste(command_list, collapse=" && "), "'")
+run
+system(run)
+
+```
+
+## Step 2 Gene burden
+
+```{r}
+
+setfile <- "BCAC_set.txt"
+
+command_list <- list(rare=list(), cadd=list(), helix=list())
+
+for (param_set in list(binary_param, continuous_param)) {
+  print(param_set[['out']])
+  
+  for(pheno in param_set[["pheno_cols"]]) {
+    print(pheno)
+    pheno_file <- file.path(universal$phenopath, paste0(pheno, "_pheno.txt"))
+    outpath <- file.path(universal[['step2_gene']], param_set[['out']])
+    
+    for (mask in c("rare", "cadd", "helix")) {
+      print(mask)
+      annofile <- paste0("BCAC_", mask, "_missense_anno.txt")
+      maskfile <- paste0("BCAC_", mask, "_missense_mask.txt")
+      
+      outfile <- paste0(pheno, "_", mask)
+    
+      regenie_cmd <- glue(
+        "ionice -c2 -n7 nice",
+        "{universal[['regenie']]}",
+        "--step 2",
+        "--bed {universal[['bedpath_exome']]}",
+        "--phenoFile {pheno_file}",
+        "--phenoColList {pheno}",
+        "--covarFile {universal[['covarfile']]}",
+        "--covarColList {param_set[['covar_cols']]}",
+        "--pred {file.path(universal[['step1_out']], param_set[['out']], pheno)}_pred.list",
+        "{param_set[['trait']]} {param_set[['firth']]}",
+        "--af-cc --write-mask --write-mask-snplist",
+        "--bsize 200 --threads 16",
+        "--anno-file {file.path(universal[['mask_path']], annofile)}",
+        "--set-list {file.path(universal[['mask_path']], setfile)}",
+        "--mask-def {file.path(universal[['mask_path']], maskfile)}",
+        "--out {file.path(outpath, outfile)}",
+        "--aaf-bins 0.001,0.01,0.05,1",
+        .sep = " "
+      )
+      command_list[[mask]][[pheno]] <- regenie_cmd
+    }
+  }
+}
+for (mask in c("rare", "cadd", "helix")) {
+  run <- paste0("screen -dmS step2_gene_p_", mask, " ionice -c2 -n7 nice bash -c '", paste(command_list[[mask]], collapse=" && "), "'")
+  system(run)
+}
+
+```
+

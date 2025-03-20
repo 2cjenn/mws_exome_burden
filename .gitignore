@@ -1,0 +1,18 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Documents
+*.html
+*.docx
+
+# Images
+*.jpg
+*.png
+*.tiff
+
+**Data/*
+**/data/*
+Documents/*
+Manuscript/*
